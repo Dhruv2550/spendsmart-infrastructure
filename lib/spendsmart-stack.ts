@@ -147,6 +147,10 @@ export class SpendSmartStack extends cdk.Stack {
     records.addMethod('GET', transactionsIntegration);
     records.addMethod('POST', transactionsIntegration);
 
+    // Add records by ID resource for DELETE operations
+    const recordById = records.addResource('{id}');
+    recordById.addMethod('DELETE', transactionsIntegration);
+
     // Budget Templates endpoints (new)
     const budgetTemplates = api.addResource('budget-templates');
     const budgetTemplatesIntegration = new apigateway.LambdaIntegration(budgetTemplatesLambda);
@@ -231,6 +235,8 @@ export class SpendSmartStack extends cdk.Stack {
     // Individual alert resource - /api/alerts/{id}
     const alertById = alerts.addResource('{id}');
     
+    // GET /api/alerts/{id} - get specific spending alert
+    alertById.addMethod('GET', spendingAlertsIntegration);
     // PUT /api/alerts/{id} - update spending alert
     // DELETE /api/alerts/{id} - delete spending alert
     alertById.addMethod('PUT', spendingAlertsIntegration);
