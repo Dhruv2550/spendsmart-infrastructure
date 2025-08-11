@@ -140,7 +140,7 @@ async function createRecurringTransaction(data) {
   const timestamp = new Date().toISOString();
   
   // Calculate next execution date
-  const nextExecution = calculateNextExecution(start_date, frequency);
+  const nextExecution = data.next_execution || start_date;
   
   const recurringTransaction = {
     PK: `RECURRING#${id}`,
@@ -194,71 +194,69 @@ async function getRecurringTransaction(id) {
   return createResponse(200, formatRecurringTransaction(result.Items[0]));
 }
 
-// Update recurring transaction
+// Replace the updateRecurringTransaction function in your recurring-transactions.js Lambda with this:
+
 async function updateRecurringTransaction(id, data) {
-  const {
-    name,
-    amount,
-    category,
-    type,
-    frequency,
-    start_date,
-    end_date,
-    description,
-    is_active
-  } = data;
-  
   const timestamp = new Date().toISOString();
   
-  // Build update expression
+  // Build update expression dynamically
   let updateExpression = 'SET updated_at = :timestamp';
   let expressionAttributeValues = {
     ':timestamp': timestamp
   };
+  let expressionAttributeNames = {}; // Only add names when needed
   
-  if (name !== undefined) {
+  if (data.name !== undefined) {
     updateExpression += ', #name = :name';
-    expressionAttributeValues[':name'] = name;
+    expressionAttributeNames['#name'] = 'name';
+    expressionAttributeValues[':name'] = data.name;
   }
   
-  if (amount !== undefined) {
+  if (data.amount !== undefined) {
     updateExpression += ', amount = :amount';
-    expressionAttributeValues[':amount'] = parseFloat(amount);
+    expressionAttributeValues[':amount'] = parseFloat(data.amount);
   }
   
-  if (category !== undefined) {
+  if (data.category !== undefined) {
     updateExpression += ', category = :category';
-    expressionAttributeValues[':category'] = category;
+    expressionAttributeValues[':category'] = data.category;
   }
   
-  if (type !== undefined) {
+  if (data.type !== undefined) {
     updateExpression += ', #type = :type';
-    expressionAttributeValues[':type'] = type;
+    expressionAttributeNames['#type'] = 'type';
+    expressionAttributeValues[':type'] = data.type;
   }
   
-  if (frequency !== undefined) {
+  if (data.frequency !== undefined) {
     updateExpression += ', frequency = :frequency';
-    expressionAttributeValues[':frequency'] = frequency;
+    expressionAttributeValues[':frequency'] = data.frequency;
   }
   
-  if (start_date !== undefined) {
+  if (data.start_date !== undefined) {
     updateExpression += ', start_date = :start_date';
-    expressionAttributeValues[':start_date'] = start_date;
+    expressionAttributeValues[':start_date'] = data.start_date;
   }
   
-  if (end_date !== undefined) {
+  if (data.end_date !== undefined) {
     updateExpression += ', end_date = :end_date';
-    expressionAttributeValues[':end_date'] = end_date;
+    expressionAttributeValues[':end_date'] = data.end_date;
   }
   
-  if (description !== undefined) {
+  if (data.description !== undefined) {
     updateExpression += ', description = :description';
-    expressionAttributeValues[':description'] = description;
+    expressionAttributeValues[':description'] = data.description;
   }
   
-  if (is_active !== undefined) {
+  if (data.is_active !== undefined) {
     updateExpression += ', is_active = :is_active';
-    expressionAttributeValues[':is_active'] = is_active;
+    expressionAttributeValues[':is_active'] = data.is_active;
+  }
+  
+  // CRITICAL FIX: Add next_execution update
+  if (data.next_execution !== undefined) {
+    updateExpression += ', next_execution = :next_execution';
+    expressionAttributeValues[':next_execution'] = data.next_execution;
   }
   
   const params = {
@@ -269,18 +267,23 @@ async function updateRecurringTransaction(id, data) {
     },
     UpdateExpression: updateExpression,
     ExpressionAttributeValues: expressionAttributeValues,
-    ExpressionAttributeNames: {
-      '#name': 'name',
-      '#type': 'type'
-    },
     ReturnValues: 'ALL_NEW'
   };
+  
+  // Only add ExpressionAttributeNames if we have any
+  if (Object.keys(expressionAttributeNames).length > 0) {
+    params.ExpressionAttributeNames = expressionAttributeNames;
+  }
+  
+  console.log('Lambda update params:', JSON.stringify(params, null, 2));
   
   const result = await dynamodb.send(new UpdateCommand(params));
   
   if (!result.Attributes) {
     return createResponse(404, { error: 'Recurring transaction not found' });
   }
+  
+  console.log('Lambda update result:', JSON.stringify(result.Attributes, null, 2));
   
   return createResponse(200, {
     message: 'Recurring transaction updated successfully',

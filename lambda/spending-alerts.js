@@ -45,7 +45,19 @@ exports.handler = async (event) => {
                 if (!pathParameters?.id) {
                     throw new Error('Alert ID is required for deletion');
                 }
-                return await deleteAlert(pathParameters.id, headers);
+            case 'PATCH':
+                // Handle PATCH endpoints for alert actions
+                if (pathParameters?.id && event.path?.includes('/read')) {
+                    return await markAlertAsRead(pathParameters.id, headers);
+                } else if (pathParameters?.id && event.path?.includes('/dismiss')) {
+                    return await dismissAlert(pathParameters.id, headers);
+                } else if (event.path?.includes('/dismiss-all/')) {
+                    const monthFromPath = event.path.split('/dismiss-all/')[1];
+                    return await dismissAllAlerts(monthFromPath, headers);
+                } else {
+                    throw new Error('Invalid PATCH endpoint');
+                }
+                            return await deleteAlert(pathParameters.id, headers);
             default:
                 throw new Error(`Unsupported method: ${httpMethod}`);
         }
@@ -314,4 +326,128 @@ async function deleteAlert(alertId, headers) {
             data: deletedAlert
         })
     };
+
+    // PATCH /api/alerts/{id}/read - Mark alert as read
+async function markAlertAsRead(alertId, headers) {
+    console.log('Marking alert as read:', alertId);
+    
+    const params = {
+        TableName: TABLE_NAME,
+        Key: marshall({
+            PK: `ALERT#${alertId}`,
+            SK: `ALERT#${alertId}`
+        }),
+        UpdateExpression: 'SET is_read = :isRead, updatedAt = :updatedAt',
+        ExpressionAttributeValues: marshall({
+            ':isRead': true,
+            ':updatedAt': new Date().toISOString()
+        }),
+        ReturnValues: 'ALL_NEW'
+    };
+    
+    const result = await dynamoDb.send(new UpdateItemCommand(params));
+    
+    if (!result.Attributes) {
+        throw Object.assign(new Error('Alert not found'), { statusCode: 404 });
+    }
+    
+    const updatedAlert = unmarshall(result.Attributes);
+    
+    return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({
+            success: true,
+            message: 'Alert marked as read',
+            data: updatedAlert
+        })
+    };
+}
+
+// PATCH /api/alerts/{id}/dismiss - Dismiss specific alert
+async function dismissAlert(alertId, headers) {
+    console.log('Dismissing alert:', alertId);
+    
+    const params = {
+        TableName: TABLE_NAME,
+        Key: marshall({
+            PK: `ALERT#${alertId}`,
+            SK: `ALERT#${alertId}`
+        }),
+        UpdateExpression: 'SET is_dismissed = :isDismissed, updatedAt = :updatedAt',
+        ExpressionAttributeValues: marshall({
+            ':isDismissed': true,
+            ':updatedAt': new Date().toISOString()
+        }),
+        ReturnValues: 'ALL_NEW'
+    };
+    
+    const result = await dynamoDb.send(new UpdateItemCommand(params));
+    
+    if (!result.Attributes) {
+        throw Object.assign(new Error('Alert not found'), { statusCode: 404 });
+    }
+    
+    const updatedAlert = unmarshall(result.Attributes);
+    
+    return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({
+            success: true,
+            message: 'Alert dismissed',
+            data: updatedAlert
+        })
+    };
+}
+
+    // PATCH /api/alerts/dismiss-all/{month} - Dismiss all alerts for a month
+    async function dismissAllAlerts(month, headers) {
+        console.log('Dismissing all alerts for month:', month);
+        
+        // First, get all alerts for the month
+        const queryParams = {
+            TableName: TABLE_NAME,
+            IndexName: 'GSI1',
+            KeyConditionExpression: 'GSI1PK = :gsi1pk',
+            ExpressionAttributeValues: marshall({
+                ':gsi1pk': 'ALERTS'
+            })
+        };
+        
+        const result = await dynamoDb.send(new QueryCommand(queryParams));
+        const alerts = result.Items?.map(item => unmarshall(item)) || [];
+        
+        // Filter by month and update each alert
+        const alertsToUpdate = alerts.filter(alert => alert.month === month || !alert.month);
+        
+        const updatePromises = alertsToUpdate.map(alert => {
+            const updateParams = {
+                TableName: TABLE_NAME,
+                Key: marshall({
+                    PK: alert.PK,
+                    SK: alert.SK
+                }),
+                UpdateExpression: 'SET is_dismissed = :isDismissed, updatedAt = :updatedAt',
+                ExpressionAttributeValues: marshall({
+                    ':isDismissed': true,
+                    ':updatedAt': new Date().toISOString()
+                })
+            };
+            
+            return dynamoDb.send(new UpdateItemCommand(updateParams));
+        });
+        
+        await Promise.all(updatePromises);
+        
+        return {
+            statusCode: 200,
+            headers,
+            body: JSON.stringify({
+                success: true,
+                message: `Dismissed ${alertsToUpdate.length} alerts for ${month}`,
+                count: alertsToUpdate.length
+            })
+        };
+    }
 }
