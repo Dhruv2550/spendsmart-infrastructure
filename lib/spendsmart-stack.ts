@@ -178,6 +178,7 @@ export class SpendSmartStack extends cdk.Stack {
     const budgetTemplate = budgets.addResource('{template}');
     const budgetMonth = budgetTemplate.addResource('{month}');
     budgetMonth.addMethod('GET', budgetsIntegration);
+    budgetMonth.addMethod('PUT', budgetsIntegration);
 
     // Budget Analysis endpoints
     const budgetAnalysis = api.addResource('budget-analysis');

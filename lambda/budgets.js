@@ -4,7 +4,9 @@ const {
   QueryCommand, 
   PutCommand, 
   ScanCommand,
-  BatchWriteCommand
+  BatchWriteCommand,
+  DeleteCommand,
+  UpdateCommand
 } = require('@aws-sdk/lib-dynamodb');
 
 const client = new DynamoDBClient({});
@@ -34,6 +36,16 @@ exports.handler = async (event) => {
   try {
     const { httpMethod, pathParameters, resource } = event;
     
+    // Handle PUT requests for updating budgets
+    if (httpMethod === 'PUT') {
+      return await updateEnvelopeBudget(event);
+    }
+    
+    // Handle DELETE requests for budget templates
+    if (httpMethod === 'DELETE' && resource.includes('/budget-templates/')) {
+      return await handleDeleteTemplate(pathParameters);
+    }
+    
     // Handle different routes
     if (resource.includes('/budget-analysis/')) {
       return await handleBudgetAnalysis(pathParameters);
@@ -49,8 +61,109 @@ exports.handler = async (event) => {
   }
 };
 
+async function updateEnvelopeBudget(event) {
+  const { template, month } = event.pathParameters;
+  const decodedTemplate = decodeURIComponent(template);
+  const decodedMonth = decodeURIComponent(month);
+  
+  let requestData;
+  try {
+    requestData = JSON.parse(event.body);
+  } catch (error) {
+    return createResponse(400, { error: 'Invalid JSON in request body' });
+  }
+  
+  const { budgets } = requestData;
+  
+  if (!budgets || !Array.isArray(budgets)) {
+    return createResponse(400, { error: 'Missing budgets array' });
+  }
+  
+  const updatePromises = [];
+  
+  for (const budget of budgets) {
+    const updateParams = {
+      TableName: TABLE_NAME,
+      Key: {
+        PK: `ENVELOPE#${decodedTemplate}`,
+        SK: `${decodedMonth}#${budget.category}`
+      },
+      UpdateExpression: 'SET budget_amount = :amount',
+      ExpressionAttributeValues: {
+        ':amount': parseFloat(budget.budget_amount)
+      }
+    };
+    
+    updatePromises.push(dynamodb.send(new UpdateCommand(updateParams)));
+  }
+  
+  try {
+    await Promise.all(updatePromises);
+    return createResponse(200, { message: 'Budgets updated successfully' });
+  } catch (error) {
+    console.error('Error updating budgets:', error);
+    return createResponse(500, { error: 'Failed to update budgets' });
+  }
+}
+
+async function handleDeleteTemplate(pathParameters) {
+  const templateName = decodeURIComponent(pathParameters?.templateName || '');
+  console.log('Deleting template:', templateName);
+  
+  if (!templateName) {
+    return createResponse(400, { error: 'Missing template name' });
+  }
+  
+  try {
+    // First, get all categories for this template
+    const getParams = {
+      TableName: TABLE_NAME,
+      KeyConditionExpression: 'PK = :pk',
+      ExpressionAttributeValues: {
+        ':pk': `TEMPLATE#${templateName}`
+      }
+    };
+    
+    const result = await dynamodb.send(new QueryCommand(getParams));
+    
+    // Delete all categories for this template
+    if (result.Items && result.Items.length > 0) {
+      const deletePromises = result.Items.map(item => {
+        const deleteParams = {
+          TableName: TABLE_NAME,
+          Key: {
+            PK: item.PK,
+            SK: item.SK
+          }
+        };
+        return dynamodb.send(new DeleteCommand(deleteParams));
+      });
+      
+      await Promise.all(deletePromises);
+      console.log(`Successfully deleted ${result.Items.length} categories for template: ${templateName}`);
+    }
+    
+    return createResponse(200, { 
+      message: 'Template deleted successfully',
+      deletedItems: result.Items?.length || 0
+    });
+    
+  } catch (error) {
+    console.error('Error deleting template:', error);
+    return createResponse(500, { 
+      error: 'Failed to delete template',
+      details: error.message 
+    });
+  }
+}
+
 async function handleBudgets(pathParameters) {
-  const { template, month } = pathParameters;
+  // FIX: Add URL decoding
+  const template = decodeURIComponent(pathParameters?.template || '');
+  const month = decodeURIComponent(pathParameters?.month || '');
+  
+  console.log('Decoded template:', template);
+  console.log('Decoded month:', month);
   
   if (!template || !month) {
     return createResponse(400, { error: 'Missing template or month parameter' });
@@ -63,7 +176,12 @@ async function handleBudgets(pathParameters) {
 }
 
 async function handleBudgetAnalysis(pathParameters) {
-  const { template, month } = pathParameters;
+  // FIX: Add URL decoding
+  const template = decodeURIComponent(pathParameters?.template || '');
+  const month = decodeURIComponent(pathParameters?.month || '');
+  
+  console.log('Analysis - Decoded template:', template);
+  console.log('Analysis - Decoded month:', month);
   
   if (!template || !month) {
     return createResponse(400, { error: 'Missing template or month parameter' });
@@ -98,28 +216,38 @@ async function getOrCreateEnvelopeBudgets(template, month) {
     }
   };
   
-  const existingResult = await dynamodb.send(new ScanCommand(existingBudgetsParams));
-  
-  if (existingResult.Items && existingResult.Items.length > 0) {
-    // Return existing envelope budgets
-    return existingResult.Items.map(item => ({
-      id: item.id,
-      template_name: item.template_name,
-      category: item.category,
-      budget_amount: item.budget_amount,
-      month: item.month,
-      rollover_enabled: item.rollover_enabled,
-      rollover_amount: item.rollover_amount || 0,
-      is_active: item.is_active,
-      created_at: item.created_at
-    }));
+  try {
+    const existingResult = await dynamodb.send(new ScanCommand(existingBudgetsParams));
+    
+    if (existingResult.Items && existingResult.Items.length > 0) {
+      console.log('Found existing envelope budgets:', existingResult.Items.length);
+      // Return existing envelope budgets
+      return existingResult.Items.map(item => ({
+        id: item.id,
+        template_name: item.template_name,
+        category: item.category,
+        budget_amount: item.budget_amount,
+        month: item.month,
+        rollover_enabled: item.rollover_enabled,
+        rollover_amount: item.rollover_amount || 0,
+        is_active: item.is_active,
+        created_at: item.created_at
+      }));
+    }
+    
+    console.log('No existing envelope budgets found, creating from template');
+    // If no envelope budgets exist, create them from the template
+    return await createEnvelopeBudgetsFromTemplate(template, month);
+    
+  } catch (error) {
+    console.error('Error in getOrCreateEnvelopeBudgets:', error);
+    throw error;
   }
-  
-  // If no envelope budgets exist, create them from the template
-  return await createEnvelopeBudgetsFromTemplate(template, month);
 }
 
 async function createEnvelopeBudgetsFromTemplate(template, month) {
+  console.log('Looking for template:', template);
+  
   // Get template categories
   const templateParams = {
     TableName: TABLE_NAME,
@@ -129,103 +257,133 @@ async function createEnvelopeBudgetsFromTemplate(template, month) {
     }
   };
   
-  const templateResult = await dynamodb.send(new QueryCommand(templateParams));
-  
-  if (!templateResult.Items || templateResult.Items.length === 0) {
-    throw new Error(`Template "${template}" not found`);
-  }
-  
-  // Calculate rollover amounts from previous month
-  const previousMonth = getPreviousMonth(month);
-  const rolloverAmounts = await calculateRolloverAmounts(template, previousMonth);
-  
-  const timestamp = new Date().toISOString();
-  const envelopeBudgets = [];
-  const writeRequests = [];
-  
-  for (const templateItem of templateResult.Items) {
-    const id = `${template}-${month}-${templateItem.category}-${Date.now()}`;
-    const rolloverAmount = rolloverAmounts[templateItem.category] || 0;
+  try {
+    const templateResult = await dynamodb.send(new QueryCommand(templateParams));
+    console.log('Template query result:', templateResult.Items?.length || 0, 'items found');
     
-    const envelopeBudget = {
-      PK: `ENVELOPE#${template}`,
-      SK: `${month}#${templateItem.category}`,
-      GSI1PK: `ENVELOPE_MONTH#${month}`,
-      GSI1SK: `${template}#${templateItem.category}`,
-      id,
-      template_name: template,
-      category: templateItem.category,
-      budget_amount: templateItem.budget_amount,
-      month,
-      rollover_enabled: templateItem.rollover_enabled,
-      rollover_amount: rolloverAmount,
-      is_active: true,
-      created_at: timestamp
-    };
-    
-    envelopeBudgets.push({
-      id: envelopeBudget.id,
-      template_name: envelopeBudget.template_name,
-      category: envelopeBudget.category,
-      budget_amount: envelopeBudget.budget_amount,
-      month: envelopeBudget.month,
-      rollover_enabled: envelopeBudget.rollover_enabled,
-      rollover_amount: envelopeBudget.rollover_amount,
-      is_active: envelopeBudget.is_active,
-      created_at: envelopeBudget.created_at
-    });
-    
-    writeRequests.push({
-      PutRequest: { Item: envelopeBudget }
-    });
-  }
-  
-  // Batch write envelope budgets
-  if (writeRequests.length > 0) {
-    const chunks = [];
-    for (let i = 0; i < writeRequests.length; i += 25) {
-      chunks.push(writeRequests.slice(i, i + 25));
-    }
-    
-    for (const chunk of chunks) {
-      await dynamodb.send(new BatchWriteCommand({
-        RequestItems: {
-          [`${TABLE_NAME}`]: chunk
+    if (!templateResult.Items || templateResult.Items.length === 0) {
+      // BETTER ERROR: Check what templates actually exist
+      const allTemplatesParams = {
+        TableName: TABLE_NAME,
+        FilterExpression: 'begins_with(PK, :pk)',
+        ExpressionAttributeValues: {
+          ':pk': 'TEMPLATE#'
         }
-      }));
+      };
+      
+      const allTemplates = await dynamodb.send(new ScanCommand(allTemplatesParams));
+      const templateNames = [...new Set(allTemplates.Items?.map(item => item.template_name) || [])];
+      
+      console.log('Available templates:', templateNames);
+      throw new Error(`Template "${template}" not found. Available templates: ${templateNames.join(', ')}`);
     }
+    
+    // Calculate rollover amounts from previous month
+    const previousMonth = getPreviousMonth(month);
+    const rolloverAmounts = await calculateRolloverAmounts(template, previousMonth);
+    
+    const timestamp = new Date().toISOString();
+    const envelopeBudgets = [];
+    const writeRequests = [];
+    
+    for (const templateItem of templateResult.Items) {
+      const id = `${template}-${month}-${templateItem.category}-${Date.now()}`;
+      const rolloverAmount = rolloverAmounts[templateItem.category] || 0;
+      
+      const envelopeBudget = {
+        PK: `ENVELOPE#${template}`,
+        SK: `${month}#${templateItem.category}`,
+        GSI1PK: `ENVELOPE_MONTH#${month}`,
+        GSI1SK: `${template}#${templateItem.category}`,
+        id,
+        template_name: template,
+        category: templateItem.category,
+        budget_amount: templateItem.budget_amount,
+        month,
+        rollover_enabled: templateItem.rollover_enabled,
+        rollover_amount: rolloverAmount,
+        is_active: true,
+        created_at: timestamp
+      };
+      
+      envelopeBudgets.push({
+        id: envelopeBudget.id,
+        template_name: envelopeBudget.template_name,
+        category: envelopeBudget.category,
+        budget_amount: envelopeBudget.budget_amount,
+        month: envelopeBudget.month,
+        rollover_enabled: envelopeBudget.rollover_enabled,
+        rollover_amount: envelopeBudget.rollover_amount,
+        is_active: envelopeBudget.is_active,
+        created_at: envelopeBudget.created_at
+      });
+      
+      writeRequests.push({
+        PutRequest: { Item: envelopeBudget }
+      });
+    }
+    
+    // Batch write envelope budgets
+    if (writeRequests.length > 0) {
+      console.log('Writing', writeRequests.length, 'envelope budgets');
+      const chunks = [];
+      for (let i = 0; i < writeRequests.length; i += 25) {
+        chunks.push(writeRequests.slice(i, i + 25));
+      }
+      
+      for (const chunk of chunks) {
+        await dynamodb.send(new BatchWriteCommand({
+          RequestItems: {
+            [`${TABLE_NAME}`]: chunk
+          }
+        }));
+      }
+    }
+    
+    console.log('Successfully created', envelopeBudgets.length, 'envelope budgets');
+    return envelopeBudgets;
+    
+  } catch (error) {
+    console.error('Error creating envelope budgets from template:', error);
+    throw error;
   }
-  
-  return envelopeBudgets;
 }
 
 async function getActualSpending(month) {
+  // Use scan with filter to find transactions for the month
   const params = {
     TableName: TABLE_NAME,
-    IndexName: 'GSI1',
-    KeyConditionExpression: 'GSI1PK = :pk',
+    FilterExpression: 'begins_with(GSI1PK, :monthPrefix) AND #type = :type',
+    ExpressionAttributeNames: {
+      '#type': 'type'
+    },
     ExpressionAttributeValues: {
-      ':pk': `MONTH#${month}`
+      ':monthPrefix': `MONTH#${month}`,
+      ':type': 'Expense'
     }
   };
   
-  const result = await dynamodb.send(new QueryCommand(params));
-  
-  // Group spending by category
-  const spendingByCategory = {};
-  
-  if (result.Items) {
-    result.Items.forEach(item => {
-      if (item.type === 'expense') {
+  try {
+    const result = await dynamodb.send(new ScanCommand(params));
+    
+    const spendingByCategory = {};
+    
+    if (result.Items) {
+      result.Items.forEach(item => {
         if (!spendingByCategory[item.category]) {
           spendingByCategory[item.category] = 0;
         }
-        spendingByCategory[item.category] += item.amount;
-      }
-    });
+        spendingByCategory[item.category] += parseFloat(item.amount);
+      });
+    }
+    
+    console.log('Actual spending by category:', spendingByCategory);
+    return spendingByCategory;
+    
+  } catch (error) {
+    console.error('Error getting actual spending:', error);
+    return {};
   }
-  
-  return spendingByCategory;
 }
 
 async function calculateRolloverAmounts(template, previousMonth) {
@@ -242,29 +400,37 @@ async function calculateRolloverAmounts(template, previousMonth) {
     }
   };
   
-  const existingResult = await dynamodb.send(new ScanCommand(existingBudgetsParams));
-  
-  // If no previous budgets exist, return empty rollover amounts
-  if (!existingResult.Items || existingResult.Items.length === 0) {
+  try {
+    const existingResult = await dynamodb.send(new ScanCommand(existingBudgetsParams));
+    
+    // If no previous budgets exist, return empty rollover amounts
+    if (!existingResult.Items || existingResult.Items.length === 0) {
+      console.log('No previous month budgets found for rollover calculation');
+      return {};
+    }
+    
+    // Get previous month's spending
+    const previousSpending = await getActualSpending(previousMonth);
+    
+    const rolloverAmounts = {};
+    
+    existingResult.Items.forEach(budget => {
+      if (budget.rollover_enabled) {
+        const spent = previousSpending[budget.category] || 0;
+        const remaining = budget.budget_amount - spent + (budget.rollover_amount || 0);
+        if (remaining > 0) {
+          rolloverAmounts[budget.category] = remaining;
+        }
+      }
+    });
+    
+    console.log('Calculated rollover amounts:', rolloverAmounts);
+    return rolloverAmounts;
+    
+  } catch (error) {
+    console.error('Error calculating rollover amounts:', error);
     return {};
   }
-  
-  // Get previous month's spending
-  const previousSpending = await getActualSpending(previousMonth);
-  
-  const rolloverAmounts = {};
-  
-  existingResult.Items.forEach(budget => {
-    if (budget.rollover_enabled) {
-      const spent = previousSpending[budget.category] || 0;
-      const remaining = budget.budget_amount - spent + (budget.rollover_amount || 0);
-      if (remaining > 0) {
-        rolloverAmounts[budget.category] = remaining;
-      }
-    }
-  });
-  
-  return rolloverAmounts;
 }
 
 function calculateBudgetAnalysis(budgets, actualSpending) {
