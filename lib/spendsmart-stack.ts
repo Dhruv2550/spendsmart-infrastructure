@@ -8,6 +8,7 @@ import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
 import { Construct } from 'constructs';
 
 interface SpendSmartStackProps extends cdk.StackProps {
@@ -19,10 +20,11 @@ export class SpendSmartStack extends cdk.Stack {
   public readonly table: dynamodb.Table;
   public readonly websiteBucket: s3.Bucket;
   public readonly distribution: cloudfront.Distribution;
+  public readonly userPool: cognito.UserPool;
+  public readonly userPoolClient: cognito.UserPoolClient;
 
   constructor(scope: Construct, id: string, props: SpendSmartStackProps) {
     super(scope, id, props);
-
     const { stage } = props;
 
     // DynamoDB Table
@@ -53,14 +55,76 @@ export class SpendSmartStack extends cdk.Stack {
       }
     });
 
-    // Common Lambda configuration
+    // Cognito User Pool V2 - NO EMAIL VERIFICATION (new pool to avoid update restrictions)
+    this.userPool = new cognito.UserPool(this, 'SpendSmartUserPoolV2', {
+      userPoolName: `SpendSmart-UserPool-V2-${stage}`,
+      selfSignUpEnabled: true,
+      signInAliases: {
+        username: true, // Use username instead of email to avoid verification
+      },
+      // NO auto-verification at all
+      autoVerify: {},
+      // Minimal required attributes
+      standardAttributes: {
+        email: {
+          required: true,
+          mutable: true,
+        },
+        givenName: {
+          required: true,
+          mutable: true,
+        },
+        familyName: {
+          required: true,
+          mutable: true,
+        },
+      },
+      // Minimal password policy for testing
+      passwordPolicy: {
+        minLength: 6,
+        requireLowercase: false,
+        requireUppercase: false,
+        requireDigits: false,
+        requireSymbols: false,
+      },
+      // No MFA
+      mfa: cognito.Mfa.OFF,
+      // Account recovery
+      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      // Remove users when stack is destroyed (dev only)
+      removalPolicy: stage === 'prod' ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // User Pool Client V2
+    this.userPoolClient = new cognito.UserPoolClient(this, 'SpendSmartUserPoolClientV2', {
+      userPool: this.userPool,
+      userPoolClientName: `SpendSmart-Client-V2-${stage}`,
+      // Client configuration
+      generateSecret: false, // For web apps, don't generate secret
+      authFlows: {
+        userPassword: true,
+        userSrp: true,
+        custom: true,
+        adminUserPassword: true,
+      },
+      // Token settings
+      accessTokenValidity: cdk.Duration.hours(1),
+      idTokenValidity: cdk.Duration.hours(1),
+      refreshTokenValidity: cdk.Duration.days(30),
+      // Prevent user existence errors
+      preventUserExistenceErrors: true,
+    });
+
+    // Common Lambda configuration with Cognito info
     const lambdaDefaults = {
       runtime: lambda.Runtime.NODEJS_18_X,
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
       environment: {
         DYNAMODB_TABLE_NAME: this.table.tableName,
-        NODE_ENV: stage
+        NODE_ENV: stage,
+        USER_POOL_ID: this.userPool.userPoolId,
+        USER_POOL_CLIENT_ID: this.userPoolClient.userPoolClientId,
       },
       logRetention: logs.RetentionDays.ONE_WEEK
     };
@@ -131,7 +195,7 @@ export class SpendSmartStack extends cdk.Stack {
       defaultCorsPreflightOptions: {
         allowOrigins: apigateway.Cors.ALL_ORIGINS,
         allowMethods: apigateway.Cors.ALL_METHODS,
-        allowHeaders: ['Content-Type']
+        allowHeaders: ['Content-Type', 'Authorization']
       },
       deployOptions: {
         stageName: stage
@@ -200,7 +264,6 @@ export class SpendSmartStack extends cdk.Stack {
 
     // Recurring transaction by ID
     const recurringById = recurring.addResource('{id}');
-
     // GET /api/recurring/{id} - get specific recurring transaction
     // PUT /api/recurring/{id} - update recurring transaction
     // DELETE /api/recurring/{id} - delete recurring transaction
@@ -279,7 +342,6 @@ export class SpendSmartStack extends cdk.Stack {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL
     });
     
-
     // CloudFront Distribution
     this.distribution = new cloudfront.Distribution(this, 'Distribution', {
       defaultBehavior: {
@@ -314,8 +376,7 @@ export class SpendSmartStack extends cdk.Stack {
       value: this.api.url,
       description: 'API Gateway endpoint URL'
     });
-    
-    
+
     new cdk.CfnOutput(this, 'WebsiteURL', {
       value: `https://${this.distribution.distributionDomainName}`,
       description: 'Website URL'
@@ -324,6 +385,16 @@ export class SpendSmartStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'S3BucketName', {
       value: this.websiteBucket.bucketName,
       description: 'S3 bucket name for frontend'
+    });
+
+    new cdk.CfnOutput(this, 'UserPoolId', {
+      value: this.userPool.userPoolId,
+      description: 'Cognito User Pool ID'
+    });
+
+    new cdk.CfnOutput(this, 'UserPoolClientId', {
+      value: this.userPoolClient.userPoolClientId,
+      description: 'Cognito User Pool Client ID'
     });
   }
 }
