@@ -26,6 +26,8 @@
     "@aws-cdk/aws-dynamodb": "^1.149.0",
     "@aws-cdk/aws-lambda": "^1.19.0",
     "@aws-cdk/aws-s3": "^1.84.0",
+    "@aws-sdk/client-dynamodb": "^3.868.0",
+    "@aws-sdk/lib-dynamodb": "^3.868.0",
     "aws-cdk-lib": "^2.208.0",
     "constructs": "^10.4.2"
   }
