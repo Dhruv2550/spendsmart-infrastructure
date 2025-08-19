@@ -188,14 +188,14 @@ export class SpendSmartStack extends cdk.Stack {
     this.table.grantReadWriteData(spendingAlertsLambda);
     this.table.grantReadWriteData(analyticsLambda);
 
-    // API Gateway
+    // API Gateway - FIXED CORS CONFIGURATION
     this.api = new apigateway.RestApi(this, 'SpendSmartAPI', {
       restApiName: `SpendSmart-API-${stage}`,
       description: 'SpendSmart Budget App API',
       defaultCorsPreflightOptions: {
         allowOrigins: apigateway.Cors.ALL_ORIGINS,
         allowMethods: apigateway.Cors.ALL_METHODS,
-        allowHeaders: ['Content-Type', 'Authorization']
+        allowHeaders: ['Content-Type', 'Authorization', 'X-User-ID'] // FIXED: Added X-User-ID
       },
       deployOptions: {
         stageName: stage

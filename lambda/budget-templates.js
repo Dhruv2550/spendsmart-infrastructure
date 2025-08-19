@@ -11,7 +11,7 @@ const corsHeaders = {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type'
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-User-ID'
 };
 
 const createResponse = (statusCode, body) => ({
@@ -19,6 +19,22 @@ const createResponse = (statusCode, body) => ({
     headers: corsHeaders,
     body: JSON.stringify(body)
 });
+
+const extractUserId = (event) => {
+    // Try X-User-ID header first
+    const userIdHeader = event.headers['X-User-ID'] || event.headers['x-user-id'];
+    if (userIdHeader) {
+        return userIdHeader;
+    }
+    
+    // Try Authorization Bearer token
+    const authHeader = event.headers['Authorization'] || event.headers['authorization'];
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        return authHeader.substring(7);
+    }
+    
+    return null;
+};
 
 exports.handler = async (event) => {
     console.log('Event:', JSON.stringify(event, null, 2));
@@ -29,20 +45,29 @@ exports.handler = async (event) => {
     
     try {
         const { httpMethod, pathParameters, body } = event;
+        
+        // Extract and validate user ID
+        const userId = extractUserId(event);
+        if (!userId) {
+            return createResponse(401, { error: 'Unauthorized: User ID required' });
+        }
+        
+        console.log('Processing budget templates request for user:', userId);
+        
         const templateName = pathParameters?.templateName;
         
         switch (httpMethod) {
             case 'GET':
-                return await getBudgetTemplates();
+                return await getBudgetTemplates(userId);
             
             case 'POST':
                 if (pathParameters?.action === 'copy') {
-                    return await copyBudgetTemplate(templateName, JSON.parse(body || '{}'));
+                    return await copyBudgetTemplate(userId, templateName, JSON.parse(body || '{}'));
                 }
-                return await createBudgetTemplate(JSON.parse(body || '{}'));
+                return await createBudgetTemplate(userId, JSON.parse(body || '{}'));
             
             case 'DELETE':
-                return await deleteBudgetTemplate(templateName);
+                return await deleteBudgetTemplate(userId, templateName);
             
             default:
                 return createResponse(405, { error: 'Method not allowed' });
@@ -54,12 +79,12 @@ exports.handler = async (event) => {
     }
 };
 
-async function getBudgetTemplates() {
+async function getBudgetTemplates(userId) {
     const params = {
         TableName: TABLE_NAME,
         FilterExpression: 'begins_with(PK, :pk)',
         ExpressionAttributeValues: {
-            ':pk': 'TEMPLATE#'
+            ':pk': `USER#${userId}#TEMPLATE#`
         }
     };
     
@@ -89,10 +114,12 @@ async function getBudgetTemplates() {
         }
     });
     
-    return createResponse(200, Array.from(templatesMap.values()));
+    const templates = Array.from(templatesMap.values());
+    console.log(`Retrieved ${templates.length} budget templates for user ${userId}`);
+    return createResponse(200, templates);
 }
 
-async function createBudgetTemplate(data) {
+async function createBudgetTemplate(userId, data) {
     const { template_name, categories } = data;
     
     if (!template_name || !categories || !Array.isArray(categories)) {
@@ -110,16 +137,17 @@ async function createBudgetTemplate(data) {
         }
         
         const item = {
-            PK: `TEMPLATE#${template_name}`,
+            PK: `USER#${userId}#TEMPLATE#${template_name}`,
             SK: `CATEGORY#${categoryName}`,
-            GSI1PK: `TEMPLATE_ALL`,
+            GSI1PK: `USER#${userId}#TEMPLATE_ALL`,
             GSI1SK: `${template_name}#${categoryName}`,
             template_name,
             category: categoryName,
             budget_amount: parseFloat(budget_amount),
             rollover_enabled,
             is_active: true,
-            created_at: timestamp
+            created_at: timestamp,
+            user_id: userId
         };
         
         writeRequests.push({
@@ -143,6 +171,8 @@ async function createBudgetTemplate(data) {
         }
     }
     
+    console.log(`Created budget template '${template_name}' with ${categories.length} categories for user ${userId}`);
+    
     return createResponse(201, {
         template_name,
         categories_created: categories.length,
@@ -150,19 +180,19 @@ async function createBudgetTemplate(data) {
     });
 }
 
-async function copyBudgetTemplate(sourceTemplateName, data) {
+async function copyBudgetTemplate(userId, sourceTemplateName, data) {
     const { new_template_name } = data;
     
     if (!sourceTemplateName || !new_template_name) {
         return createResponse(400, { error: 'Missing source template name or new template name' });
     }
     
-    // Get source template categories
+    // Get source template categories - USER FILTERED
     const queryParams = {
         TableName: TABLE_NAME,
         KeyConditionExpression: 'PK = :pk',
         ExpressionAttributeValues: {
-            ':pk': `TEMPLATE#${sourceTemplateName}`
+            ':pk': `USER#${userId}#TEMPLATE#${sourceTemplateName}`
         }
     };
     
@@ -177,16 +207,17 @@ async function copyBudgetTemplate(sourceTemplateName, data) {
     
     for (const sourceItem of sourceResult.Items) {
         const newItem = {
-            PK: `TEMPLATE#${new_template_name}`,
+            PK: `USER#${userId}#TEMPLATE#${new_template_name}`,
             SK: sourceItem.SK,
-            GSI1PK: `TEMPLATE_ALL`,
+            GSI1PK: `USER#${userId}#TEMPLATE_ALL`,
             GSI1SK: `${new_template_name}#${sourceItem.category}`,
             template_name: new_template_name,
             category: sourceItem.category,
             budget_amount: sourceItem.budget_amount,
             rollover_enabled: sourceItem.rollover_enabled,
             is_active: true,
-            created_at: timestamp
+            created_at: timestamp,
+            user_id: userId
         };
         
         writeRequests.push({
@@ -208,6 +239,8 @@ async function copyBudgetTemplate(sourceTemplateName, data) {
         }));
     }
     
+    console.log(`Copied budget template '${sourceTemplateName}' to '${new_template_name}' for user ${userId}`);
+    
     return createResponse(201, {
         source_template: sourceTemplateName,
         new_template: new_template_name,
@@ -216,21 +249,21 @@ async function copyBudgetTemplate(sourceTemplateName, data) {
     });
 }
 
-async function deleteBudgetTemplate(templateName) {
+async function deleteBudgetTemplate(userId, templateName) {
     // ADD URL DECODING HERE
     const decodedTemplateName = decodeURIComponent(templateName || '');
-    console.log('Deleting template - Original:', templateName, 'Decoded:', decodedTemplateName);
+    console.log('Deleting template for user', userId, '- Original:', templateName, 'Decoded:', decodedTemplateName);
     
     if (!decodedTemplateName) {
         return createResponse(400, { error: 'Missing template name' });
     }
     
-    // Get all categories for this template - USE DECODED NAME
+    // Get all categories for this template - USER FILTERED
     const queryParams = {
         TableName: TABLE_NAME,
         KeyConditionExpression: 'PK = :pk',
         ExpressionAttributeValues: {
-            ':pk': `TEMPLATE#${decodedTemplateName}`
+            ':pk': `USER#${userId}#TEMPLATE#${decodedTemplateName}`
         }
     };
     
@@ -266,6 +299,8 @@ async function deleteBudgetTemplate(templateName) {
             }
         }));
     }
+    
+    console.log(`Deleted budget template '${decodedTemplateName}' with ${result.Items.length} categories for user ${userId}`);
     
     return createResponse(200, {
         template_name: decodedTemplateName,

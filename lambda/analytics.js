@@ -4,6 +4,22 @@ const { unmarshall } = require('@aws-sdk/util-dynamodb');
 const dynamoDb = new DynamoDBClient({ region: 'us-east-1' });
 const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
 
+const extractUserId = (event) => {
+    // Try X-User-ID header first
+    const userIdHeader = event.headers['X-User-ID'] || event.headers['x-user-id'];
+    if (userIdHeader) {
+        return userIdHeader;
+    }
+    
+    // Try Authorization Bearer token
+    const authHeader = event.headers['Authorization'] || event.headers['authorization'];
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        return authHeader.substring(7);
+    }
+    
+    return null;
+};
+
 exports.handler = async (event) => {
     console.log('Analytics event received:', JSON.stringify(event, null, 2));
     
@@ -11,7 +27,7 @@ exports.handler = async (event) => {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-User-ID'
     };
 
     try {
@@ -26,8 +42,20 @@ exports.handler = async (event) => {
             };
         }
 
+        // Extract and validate user ID
+        const userId = extractUserId(event);
+        if (!userId) {
+            return {
+                statusCode: 401,
+                headers,
+                body: JSON.stringify({ error: 'Unauthorized: User ID required' })
+            };
+        }
+
+        console.log('Processing analytics request for user:', userId);
+
         if (httpMethod === 'GET') {
-            return await getAnalyticsInsights(headers);
+            return await getAnalyticsInsights(headers, userId);
         } else {
             throw new Error(`Unsupported method: ${httpMethod}`);
         }
@@ -44,21 +72,21 @@ exports.handler = async (event) => {
 };
 
 // GET /api/analytics/insights - Get AI-powered spending insights
-async function getAnalyticsInsights(headers) {
-    console.log('Generating analytics insights');
+async function getAnalyticsInsights(headers, userId) {
+    console.log('Generating analytics insights for user:', userId);
     
     try {
-        // Get all transactions from the last 6 months
-        const transactionsData = await getRecentTransactions();
+        // Get all transactions from the last 6 months for this user
+        const transactionsData = await getRecentTransactions(userId);
         const transactions = transactionsData.transactions || [];
         
-        // Get budget templates for context
-        const budgetTemplates = await getBudgetTemplates();
+        // Get budget templates for context for this user
+        const budgetTemplates = await getBudgetTemplates(userId);
         
         // Generate comprehensive insights
         const insights = await generateInsights(transactions, budgetTemplates);
         
-        console.log(`Generated ${insights.length} insights from ${transactions.length} transactions`);
+        console.log(`Generated ${insights.length} insights from ${transactions.length} transactions for user ${userId}`);
         
         return {
             statusCode: 200,
@@ -82,22 +110,21 @@ async function getAnalyticsInsights(headers) {
     }
 }
 
-// Get recent transactions for analysis
-async function getRecentTransactions() {
+// Get recent transactions for analysis - USER FILTERED
+async function getRecentTransactions(userId) {
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
     
     const params = {
         TableName: TABLE_NAME,
-        IndexName: 'GSI1',
-        KeyConditionExpression: 'GSI1PK = :gsi1pk',
+        FilterExpression: 'begins_with(PK, :pk)',
         ExpressionAttributeValues: {
-            ':gsi1pk': { S: 'TRANSACTIONS' }
+            ':pk': { S: `USER#${userId}#TRANSACTION` }
         }
     };
 
     try {
-        const result = await dynamoDb.send(new QueryCommand(params));
+        const result = await dynamoDb.send(new ScanCommand(params));
         const transactions = result.Items?.map(item => unmarshall(item)) || [];
         
         // Filter to last 6 months and sort by date
@@ -105,29 +132,31 @@ async function getRecentTransactions() {
             .filter(t => new Date(t.date) >= sixMonthsAgo)
             .sort((a, b) => new Date(b.date) - new Date(a.date));
         
+        console.log(`Retrieved ${recentTransactions.length} recent transactions for user ${userId}`);
         return { transactions: recentTransactions };
     } catch (error) {
-        console.error('Error fetching transactions:', error);
+        console.error('Error fetching transactions for user', userId, ':', error);
         return { transactions: [] };
     }
 }
 
-// Get budget templates for context
-async function getBudgetTemplates() {
+// Get budget templates for context - USER FILTERED
+async function getBudgetTemplates(userId) {
     const params = {
         TableName: TABLE_NAME,
-        IndexName: 'GSI1',
-        KeyConditionExpression: 'GSI1PK = :gsi1pk',
+        FilterExpression: 'begins_with(PK, :pk)',
         ExpressionAttributeValues: {
-            ':gsi1pk': { S: 'BUDGET_TEMPLATES' }
+            ':pk': { S: `USER#${userId}#BUDGET` }
         }
     };
 
     try {
-        const result = await dynamoDb.send(new QueryCommand(params));
-        return result.Items?.map(item => unmarshall(item)) || [];
+        const result = await dynamoDb.send(new ScanCommand(params));
+        const budgetTemplates = result.Items?.map(item => unmarshall(item)) || [];
+        console.log(`Retrieved ${budgetTemplates.length} budget templates for user ${userId}`);
+        return budgetTemplates;
     } catch (error) {
-        console.error('Error fetching budget templates:', error);
+        console.error('Error fetching budget templates for user', userId, ':', error);
         return [];
     }
 }

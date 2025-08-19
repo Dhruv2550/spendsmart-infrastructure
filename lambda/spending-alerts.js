@@ -4,14 +4,30 @@ const { marshall, unmarshall } = require('@aws-sdk/util-dynamodb');
 const dynamoDb = new DynamoDBClient({ region: 'us-east-1' });
 const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
 
+const extractUserId = (event) => {
+    // Try X-User-ID header first
+    const userIdHeader = event.headers['X-User-ID'] || event.headers['x-user-id'];
+    if (userIdHeader) {
+        return userIdHeader;
+    }
+    
+    // Try Authorization Bearer token
+    const authHeader = event.headers['Authorization'] || event.headers['authorization'];
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        return authHeader.substring(7);
+    }
+    
+    return null;
+};
+
 exports.handler = async (event) => {
     console.log('Event received:', JSON.stringify(event, null, 2));
     
     const headers = {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, PATCH',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-User-ID'
     };
 
     try {
@@ -26,38 +42,50 @@ exports.handler = async (event) => {
             };
         }
 
+        // Extract and validate user ID
+        const userId = extractUserId(event);
+        if (!userId) {
+            return {
+                statusCode: 401,
+                headers,
+                body: JSON.stringify({ error: 'Unauthorized: User ID required' })
+            };
+        }
+
+        console.log('Processing alerts request for user:', userId);
+
         // Route to appropriate handler
         switch (httpMethod) {
             case 'GET':
-            if (pathParameters?.id) {
-                return await getAlert(pathParameters.id, headers);
-            } else {
-                return await getAllAlerts(headers);
-            }
+                if (pathParameters?.id) {
+                    return await getAlert(pathParameters.id, headers, userId);
+                } else {
+                    return await getAllAlerts(headers, userId);
+                }
             case 'POST':
-                return await createAlert(JSON.parse(body || '{}'), headers);
+                return await createAlert(JSON.parse(body || '{}'), headers, userId);
             case 'PUT':
                 if (!pathParameters?.id) {
                     throw new Error('Alert ID is required for updates');
                 }
-                return await updateAlert(pathParameters.id, JSON.parse(body || '{}'), headers);
+                return await updateAlert(pathParameters.id, JSON.parse(body || '{}'), headers, userId);
             case 'DELETE':
                 if (!pathParameters?.id) {
                     throw new Error('Alert ID is required for deletion');
                 }
+                return await deleteAlert(pathParameters.id, headers, userId);
             case 'PATCH':
                 // Handle PATCH endpoints for alert actions
                 if (pathParameters?.id && event.path?.includes('/read')) {
-                    return await markAlertAsRead(pathParameters.id, headers);
+                    return await markAlertAsRead(pathParameters.id, headers, userId);
                 } else if (pathParameters?.id && event.path?.includes('/dismiss')) {
-                    return await dismissAlert(pathParameters.id, headers);
+                    return await dismissAlert(pathParameters.id, headers, userId);
                 } else if (event.path?.includes('/dismiss-all/')) {
                     const monthFromPath = event.path.split('/dismiss-all/')[1];
-                    return await dismissAllAlerts(monthFromPath, headers);
+                    return await dismissAllAlerts(monthFromPath, headers, userId);
                 } else {
                     throw new Error('Invalid PATCH endpoint');
                 }
-                            return await deleteAlert(pathParameters.id, headers);
             default:
                 throw new Error(`Unsupported method: ${httpMethod}`);
         }
@@ -73,23 +101,23 @@ exports.handler = async (event) => {
     }
 };
 
-// GET /api/alerts - Get all spending alerts
-async function getAllAlerts(headers) {
-    console.log('Getting all spending alerts');
+// GET /api/alerts - Get all spending alerts - USER FILTERED
+async function getAllAlerts(headers, userId) {
+    console.log('Getting all spending alerts for user:', userId);
     
     const params = {
         TableName: TABLE_NAME,
         IndexName: 'GSI1',
         KeyConditionExpression: 'GSI1PK = :gsi1pk',
         ExpressionAttributeValues: marshall({
-            ':gsi1pk': 'ALERTS'
+            ':gsi1pk': `USER#${userId}#ALERTS`
         })
     };
 
     const result = await dynamoDb.send(new QueryCommand(params));
     const alerts = result.Items?.map(item => unmarshall(item)) || [];
     
-    console.log(`Found ${alerts.length} alerts`);
+    console.log(`Found ${alerts.length} alerts for user ${userId}`);
     
     return {
         statusCode: 200,
@@ -102,20 +130,19 @@ async function getAllAlerts(headers) {
     };
 }
 
-// GET /api/alerts/{id} - Get specific spending alert
-async function getAlert(alertId, headers) {
-    console.log('Getting specific alert:', alertId);
+// GET /api/alerts/{id} - Get specific spending alert - USER FILTERED
+async function getAlert(alertId, headers, userId) {
+    console.log('Getting specific alert for user', userId, ':', alertId);
     
     const params = {
         TableName: TABLE_NAME,
         Key: marshall({
-            PK: `ALERT#${alertId}`,
+            PK: `USER#${userId}#ALERT#${alertId}`,
             SK: `ALERT#${alertId}`
         })
     };
 
     try {
-        const { GetItemCommand } = require('@aws-sdk/client-dynamodb');
         const result = await dynamoDb.send(new GetItemCommand(params));
         
         if (!result.Item) {
@@ -131,6 +158,8 @@ async function getAlert(alertId, headers) {
         
         const alert = unmarshall(result.Item);
         
+        console.log(`Retrieved alert ${alertId} for user ${userId}`);
+        
         return {
             statusCode: 200,
             headers,
@@ -140,14 +169,14 @@ async function getAlert(alertId, headers) {
             })
         };
     } catch (error) {
-        console.error('Error getting alert:', error);
+        console.error('Error getting alert for user', userId, ':', error);
         throw error;
     }
 }
 
-// POST /api/alerts - Create new spending alert
-async function createAlert(alertData, headers) {
-    console.log('Creating new alert:', alertData);
+// POST /api/alerts - Create new spending alert - USER SCOPED
+async function createAlert(alertData, headers, userId) {
+    console.log('Creating new alert for user', userId, ':', alertData);
     
     // Validate required fields
     const requiredFields = ['name', 'type', 'condition', 'threshold'];
@@ -174,9 +203,9 @@ async function createAlert(alertData, headers) {
     const timestamp = new Date().toISOString();
     
     const alert = {
-        PK: `ALERT#${alertId}`,
+        PK: `USER#${userId}#ALERT#${alertId}`,
         SK: `ALERT#${alertId}`,
-        GSI1PK: 'ALERTS',
+        GSI1PK: `USER#${userId}#ALERTS`,
         GSI1SK: timestamp,
         id: alertId,
         name: alertData.name,
@@ -189,7 +218,8 @@ async function createAlert(alertData, headers) {
         notificationMethods: alertData.notificationMethods || ['APP'],
         description: alertData.description || '',
         createdAt: timestamp,
-        updatedAt: timestamp
+        updatedAt: timestamp,
+        user_id: userId
     };
     
     const params = {
@@ -199,7 +229,7 @@ async function createAlert(alertData, headers) {
     
     await dynamoDb.send(new PutItemCommand(params));
     
-    console.log('Alert created successfully:', alertId);
+    console.log('Alert created successfully for user', userId, ':', alertId);
     
     return {
         statusCode: 201,
@@ -212,9 +242,9 @@ async function createAlert(alertData, headers) {
     };
 }
 
-// PUT /api/alerts/{id} - Update spending alert
-async function updateAlert(alertId, updateData, headers) {
-    console.log('Updating alert:', alertId, updateData);
+// PUT /api/alerts/{id} - Update spending alert - USER FILTERED
+async function updateAlert(alertId, updateData, headers, userId) {
+    console.log('Updating alert for user', userId, ':', alertId, updateData);
     
     // Validate alert type if provided
     if (updateData.type) {
@@ -264,7 +294,7 @@ async function updateAlert(alertId, updateData, headers) {
     const params = {
         TableName: TABLE_NAME,
         Key: marshall({
-            PK: `ALERT#${alertId}`,
+            PK: `USER#${userId}#ALERT#${alertId}`,
             SK: `ALERT#${alertId}`
         }),
         UpdateExpression: `SET ${updateExpressions.join(', ')}`,
@@ -281,7 +311,7 @@ async function updateAlert(alertId, updateData, headers) {
     
     const updatedAlert = unmarshall(result.Attributes);
     
-    console.log('Alert updated successfully:', alertId);
+    console.log('Alert updated successfully for user', userId, ':', alertId);
     
     return {
         statusCode: 200,
@@ -294,14 +324,14 @@ async function updateAlert(alertId, updateData, headers) {
     };
 }
 
-// DELETE /api/alerts/{id} - Delete spending alert
-async function deleteAlert(alertId, headers) {
-    console.log('Deleting alert:', alertId);
+// DELETE /api/alerts/{id} - Delete spending alert - USER FILTERED
+async function deleteAlert(alertId, headers, userId) {
+    console.log('Deleting alert for user', userId, ':', alertId);
     
     const params = {
         TableName: TABLE_NAME,
         Key: marshall({
-            PK: `ALERT#${alertId}`,
+            PK: `USER#${userId}#ALERT#${alertId}`,
             SK: `ALERT#${alertId}`
         }),
         ReturnValues: 'ALL_OLD'
@@ -315,7 +345,7 @@ async function deleteAlert(alertId, headers) {
     
     const deletedAlert = unmarshall(result.Attributes);
     
-    console.log('Alert deleted successfully:', alertId);
+    console.log('Alert deleted successfully for user', userId, ':', alertId);
     
     return {
         statusCode: 200,
@@ -326,15 +356,16 @@ async function deleteAlert(alertId, headers) {
             data: deletedAlert
         })
     };
+}
 
-    // PATCH /api/alerts/{id}/read - Mark alert as read
-async function markAlertAsRead(alertId, headers) {
-    console.log('Marking alert as read:', alertId);
+// PATCH /api/alerts/{id}/read - Mark alert as read - USER FILTERED
+async function markAlertAsRead(alertId, headers, userId) {
+    console.log('Marking alert as read for user', userId, ':', alertId);
     
     const params = {
         TableName: TABLE_NAME,
         Key: marshall({
-            PK: `ALERT#${alertId}`,
+            PK: `USER#${userId}#ALERT#${alertId}`,
             SK: `ALERT#${alertId}`
         }),
         UpdateExpression: 'SET is_read = :isRead, updatedAt = :updatedAt',
@@ -353,6 +384,8 @@ async function markAlertAsRead(alertId, headers) {
     
     const updatedAlert = unmarshall(result.Attributes);
     
+    console.log(`Alert ${alertId} marked as read for user ${userId}`);
+    
     return {
         statusCode: 200,
         headers,
@@ -364,14 +397,14 @@ async function markAlertAsRead(alertId, headers) {
     };
 }
 
-// PATCH /api/alerts/{id}/dismiss - Dismiss specific alert
-async function dismissAlert(alertId, headers) {
-    console.log('Dismissing alert:', alertId);
+// PATCH /api/alerts/{id}/dismiss - Dismiss specific alert - USER FILTERED
+async function dismissAlert(alertId, headers, userId) {
+    console.log('Dismissing alert for user', userId, ':', alertId);
     
     const params = {
         TableName: TABLE_NAME,
         Key: marshall({
-            PK: `ALERT#${alertId}`,
+            PK: `USER#${userId}#ALERT#${alertId}`,
             SK: `ALERT#${alertId}`
         }),
         UpdateExpression: 'SET is_dismissed = :isDismissed, updatedAt = :updatedAt',
@@ -390,6 +423,8 @@ async function dismissAlert(alertId, headers) {
     
     const updatedAlert = unmarshall(result.Attributes);
     
+    console.log(`Alert ${alertId} dismissed for user ${userId}`);
+    
     return {
         statusCode: 200,
         headers,
@@ -401,53 +436,54 @@ async function dismissAlert(alertId, headers) {
     };
 }
 
-    // PATCH /api/alerts/dismiss-all/{month} - Dismiss all alerts for a month
-    async function dismissAllAlerts(month, headers) {
-        console.log('Dismissing all alerts for month:', month);
-        
-        // First, get all alerts for the month
-        const queryParams = {
+// PATCH /api/alerts/dismiss-all/{month} - Dismiss all alerts for a month - USER FILTERED
+async function dismissAllAlerts(month, headers, userId) {
+    console.log('Dismissing all alerts for month', month, 'for user', userId);
+    
+    // First, get all alerts for this user
+    const queryParams = {
+        TableName: TABLE_NAME,
+        IndexName: 'GSI1',
+        KeyConditionExpression: 'GSI1PK = :gsi1pk',
+        ExpressionAttributeValues: marshall({
+            ':gsi1pk': `USER#${userId}#ALERTS`
+        })
+    };
+    
+    const result = await dynamoDb.send(new QueryCommand(queryParams));
+    const alerts = result.Items?.map(item => unmarshall(item)) || [];
+    
+    // Filter by month and update each alert
+    const alertsToUpdate = alerts.filter(alert => alert.month === month || !alert.month);
+    
+    const updatePromises = alertsToUpdate.map(alert => {
+        const updateParams = {
             TableName: TABLE_NAME,
-            IndexName: 'GSI1',
-            KeyConditionExpression: 'GSI1PK = :gsi1pk',
+            Key: marshall({
+                PK: alert.PK,
+                SK: alert.SK
+            }),
+            UpdateExpression: 'SET is_dismissed = :isDismissed, updatedAt = :updatedAt',
             ExpressionAttributeValues: marshall({
-                ':gsi1pk': 'ALERTS'
+                ':isDismissed': true,
+                ':updatedAt': new Date().toISOString()
             })
         };
         
-        const result = await dynamoDb.send(new QueryCommand(queryParams));
-        const alerts = result.Items?.map(item => unmarshall(item)) || [];
-        
-        // Filter by month and update each alert
-        const alertsToUpdate = alerts.filter(alert => alert.month === month || !alert.month);
-        
-        const updatePromises = alertsToUpdate.map(alert => {
-            const updateParams = {
-                TableName: TABLE_NAME,
-                Key: marshall({
-                    PK: alert.PK,
-                    SK: alert.SK
-                }),
-                UpdateExpression: 'SET is_dismissed = :isDismissed, updatedAt = :updatedAt',
-                ExpressionAttributeValues: marshall({
-                    ':isDismissed': true,
-                    ':updatedAt': new Date().toISOString()
-                })
-            };
-            
-            return dynamoDb.send(new UpdateItemCommand(updateParams));
-        });
-        
-        await Promise.all(updatePromises);
-        
-        return {
-            statusCode: 200,
-            headers,
-            body: JSON.stringify({
-                success: true,
-                message: `Dismissed ${alertsToUpdate.length} alerts for ${month}`,
-                count: alertsToUpdate.length
-            })
-        };
-    }
+        return dynamoDb.send(new UpdateItemCommand(updateParams));
+    });
+    
+    await Promise.all(updatePromises);
+    
+    console.log(`Dismissed ${alertsToUpdate.length} alerts for ${month} for user ${userId}`);
+    
+    return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({
+            success: true,
+            message: `Dismissed ${alertsToUpdate.length} alerts for ${month}`,
+            count: alertsToUpdate.length
+        })
+    };
 }

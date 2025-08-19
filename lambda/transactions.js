@@ -9,7 +9,7 @@ const corsHeaders = {
   'Content-Type': 'application/json',
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type'
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-User-ID'
 };
 
 const createResponse = (statusCode, body) => ({
@@ -17,6 +17,22 @@ const createResponse = (statusCode, body) => ({
   headers: corsHeaders,
   body: JSON.stringify(body)
 });
+
+const extractUserId = (event) => {
+  // Try X-User-ID header first
+  const userIdHeader = event.headers['X-User-ID'] || event.headers['x-user-id'];
+  if (userIdHeader) {
+    return userIdHeader;
+  }
+  
+  // Try Authorization Bearer token
+  const authHeader = event.headers['Authorization'] || event.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.substring(7);
+  }
+  
+  return null;
+};
 
 exports.handler = async (event) => {
   console.log('Event:', JSON.stringify(event, null, 2));
@@ -28,12 +44,20 @@ exports.handler = async (event) => {
   try {
     const { httpMethod, pathParameters, body } = event;
     
+    // Extract and validate user ID
+    const userId = extractUserId(event);
+    if (!userId) {
+      return createResponse(401, { error: 'Unauthorized: User ID required' });
+    }
+    
+    console.log('Processing request for user:', userId);
+    
     if (httpMethod === 'GET' && !pathParameters) {
       const params = {
         TableName: TABLE_NAME,
         FilterExpression: 'begins_with(PK, :pk)',
         ExpressionAttributeValues: {
-          ':pk': 'USER#default#TRANSACTION'
+          ':pk': `USER#${userId}#TRANSACTION`
         }
       };
       
@@ -47,6 +71,7 @@ exports.handler = async (event) => {
         date: item.date
       }));
       
+      console.log(`Retrieved ${transactions.length} transactions for user ${userId}`);
       return createResponse(200, transactions);
     }
     
@@ -60,7 +85,7 @@ exports.handler = async (event) => {
       
       const id = Date.now().toString();
       const item = {
-        PK: 'USER#default#TRANSACTION',
+        PK: `USER#${userId}#TRANSACTION`,
         SK: 'TRANSACTION#' + id,
         GSI1PK: 'MONTH#' + (date || new Date().toISOString().substring(0, 7)),
         GSI1SK: category + '#' + id,
@@ -70,13 +95,16 @@ exports.handler = async (event) => {
         amount: parseFloat(amount),
         note: note || '',
         date: date || new Date().toISOString().split('T')[0],
-        created_at: new Date().toISOString()
+        created_at: new Date().toISOString(),
+        user_id: userId
       };
       
       await dynamodb.send(new PutCommand({
         TableName: TABLE_NAME,
         Item: item
       }));
+      
+      console.log(`Created transaction ${id} for user ${userId}`);
       
       return createResponse(201, {
         id: item.id,
@@ -96,10 +124,12 @@ exports.handler = async (event) => {
       await dynamodb.send(new DeleteCommand({
         TableName: TABLE_NAME,
         Key: {
-          PK: 'USER#default#TRANSACTION',
+          PK: `USER#${userId}#TRANSACTION`,
           SK: 'TRANSACTION#' + transactionId
         }
       }));
+      
+      console.log(`Deleted transaction ${transactionId} for user ${userId}`);
       
       return createResponse(200, { message: 'Transaction deleted successfully' });
     }

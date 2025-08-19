@@ -16,7 +16,7 @@ const corsHeaders = {
   'Content-Type': 'application/json',
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type'
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-User-ID'
 };
 
 const createResponse = (statusCode, body) => ({
@@ -24,6 +24,22 @@ const createResponse = (statusCode, body) => ({
   headers: corsHeaders,
   body: JSON.stringify(body)
 });
+
+const extractUserId = (event) => {
+  // Try X-User-ID header first
+  const userIdHeader = event.headers['X-User-ID'] || event.headers['x-user-id'];
+  if (userIdHeader) {
+    return userIdHeader;
+  }
+  
+  // Try Authorization Bearer token
+  const authHeader = event.headers['Authorization'] || event.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.substring(7);
+  }
+  
+  return null;
+};
 
 exports.handler = async (event) => {
   console.log('Event:', JSON.stringify(event, null, 2));
@@ -35,50 +51,58 @@ exports.handler = async (event) => {
   try {
     const { httpMethod, pathParameters, resource } = event;
     
+    // Extract and validate user ID
+    const userId = extractUserId(event);
+    if (!userId) {
+      return createResponse(401, { error: 'Unauthorized: User ID required' });
+    }
+    
+    console.log('Processing recurring transactions request for user:', userId);
+    
     // Route handling for recurring transactions
     if (resource === '/api/recurring') {
       if (httpMethod === 'GET') {
-        return await getAllRecurringTransactions();
+        return await getAllRecurringTransactions(userId);
       } else if (httpMethod === 'POST') {
-        return await createRecurringTransaction(JSON.parse(event.body));
+        return await createRecurringTransaction(JSON.parse(event.body), userId);
       }
     }
     
     if (resource === '/api/recurring/{id}') {
       const { id } = pathParameters;
       if (httpMethod === 'GET') {
-        return await getRecurringTransaction(id);
+        return await getRecurringTransaction(id, userId);
       } else if (httpMethod === 'PUT') {
-        return await updateRecurringTransaction(id, JSON.parse(event.body));
+        return await updateRecurringTransaction(id, JSON.parse(event.body), userId);
       } else if (httpMethod === 'DELETE') {
-        return await deleteRecurringTransaction(id);
+        return await deleteRecurringTransaction(id, userId);
       }
     }
     
     if (resource === '/api/recurring/{id}/toggle') {
       const { id } = pathParameters;
       if (httpMethod === 'PUT') {
-        return await toggleRecurringTransaction(id);
+        return await toggleRecurringTransaction(id, userId);
       }
     }
     
     if (resource === '/api/recurring/{id}/execute') {
       const { id } = pathParameters;
       if (httpMethod === 'POST') {
-        return await executeRecurringTransaction(id);
+        return await executeRecurringTransaction(id, userId);
       }
     }
     
     if (resource === '/api/recurring/execute-due') {
       if (httpMethod === 'POST') {
-        return await executeDueTransactions();
+        return await executeDueTransactions(userId);
       }
     }
     
     if (resource === '/api/recurring/upcoming') {
       if (httpMethod === 'GET') {
         const days = event.queryStringParameters?.days || 7;
-        return await getUpcomingTransactions(parseInt(days));
+        return await getUpcomingTransactions(parseInt(days), userId);
       }
     }
     
@@ -90,13 +114,13 @@ exports.handler = async (event) => {
   }
 };
 
-// Get all recurring transactions
-async function getAllRecurringTransactions() {
+// Get all recurring transactions - USER FILTERED
+async function getAllRecurringTransactions(userId) {
   const params = {
     TableName: TABLE_NAME,
     FilterExpression: 'begins_with(PK, :pk)',
     ExpressionAttributeValues: {
-      ':pk': 'RECURRING#'
+      ':pk': `USER#${userId}#RECURRING#`
     }
   };
   
@@ -104,11 +128,12 @@ async function getAllRecurringTransactions() {
   
   const transactions = result.Items?.map(formatRecurringTransaction) || [];
   
+  console.log(`Retrieved ${transactions.length} recurring transactions for user ${userId}`);
   return createResponse(200, transactions);
 }
 
-// Create new recurring transaction
-async function createRecurringTransaction(data) {
+// Create new recurring transaction - USER SCOPED
+async function createRecurringTransaction(data, userId) {
   const {
     name,
     amount,
@@ -143,9 +168,9 @@ async function createRecurringTransaction(data) {
   const nextExecution = data.next_execution || start_date;
   
   const recurringTransaction = {
-    PK: `RECURRING#${id}`,
+    PK: `USER#${userId}#RECURRING#${id}`,
     SK: 'METADATA',
-    GSI1PK: 'RECURRING_ACTIVE',
+    GSI1PK: `USER#${userId}#RECURRING_ACTIVE`,
     GSI1SK: is_active ? `${nextExecution}#${id}` : `INACTIVE#${id}`,
     id,
     name,
@@ -161,7 +186,8 @@ async function createRecurringTransaction(data) {
     last_executed: null,
     execution_count: 0,
     created_at: timestamp,
-    updated_at: timestamp
+    updated_at: timestamp,
+    user_id: userId
   };
   
   await dynamodb.send(new PutCommand({
@@ -169,19 +195,21 @@ async function createRecurringTransaction(data) {
     Item: recurringTransaction
   }));
   
+  console.log(`Created recurring transaction ${id} for user ${userId}`);
+  
   return createResponse(201, {
     message: 'Recurring transaction created successfully',
     transaction: formatRecurringTransaction(recurringTransaction)
   });
 }
 
-// Get specific recurring transaction
-async function getRecurringTransaction(id) {
+// Get specific recurring transaction - USER FILTERED
+async function getRecurringTransaction(id, userId) {
   const params = {
     TableName: TABLE_NAME,
     KeyConditionExpression: 'PK = :pk',
     ExpressionAttributeValues: {
-      ':pk': `RECURRING#${id}`
+      ':pk': `USER#${userId}#RECURRING#${id}`
     }
   };
   
@@ -191,12 +219,12 @@ async function getRecurringTransaction(id) {
     return createResponse(404, { error: 'Recurring transaction not found' });
   }
   
+  console.log(`Retrieved recurring transaction ${id} for user ${userId}`);
   return createResponse(200, formatRecurringTransaction(result.Items[0]));
 }
 
-// Replace the updateRecurringTransaction function in your recurring-transactions.js Lambda with this:
-
-async function updateRecurringTransaction(id, data) {
+// Update recurring transaction - USER FILTERED
+async function updateRecurringTransaction(id, data, userId) {
   const timestamp = new Date().toISOString();
   
   // Build update expression dynamically
@@ -262,7 +290,7 @@ async function updateRecurringTransaction(id, data) {
   const params = {
     TableName: TABLE_NAME,
     Key: {
-      PK: `RECURRING#${id}`,
+      PK: `USER#${userId}#RECURRING#${id}`,
       SK: 'METADATA'
     },
     UpdateExpression: updateExpression,
@@ -275,7 +303,7 @@ async function updateRecurringTransaction(id, data) {
     params.ExpressionAttributeNames = expressionAttributeNames;
   }
   
-  console.log('Lambda update params:', JSON.stringify(params, null, 2));
+  console.log('Updating recurring transaction for user', userId, '- params:', JSON.stringify(params, null, 2));
   
   const result = await dynamodb.send(new UpdateCommand(params));
   
@@ -283,7 +311,7 @@ async function updateRecurringTransaction(id, data) {
     return createResponse(404, { error: 'Recurring transaction not found' });
   }
   
-  console.log('Lambda update result:', JSON.stringify(result.Attributes, null, 2));
+  console.log(`Updated recurring transaction ${id} for user ${userId}`);
   
   return createResponse(200, {
     message: 'Recurring transaction updated successfully',
@@ -291,12 +319,12 @@ async function updateRecurringTransaction(id, data) {
   });
 }
 
-// Delete recurring transaction
-async function deleteRecurringTransaction(id) {
+// Delete recurring transaction - USER FILTERED
+async function deleteRecurringTransaction(id, userId) {
   const params = {
     TableName: TABLE_NAME,
     Key: {
-      PK: `RECURRING#${id}`,
+      PK: `USER#${userId}#RECURRING#${id}`,
       SK: 'METADATA'
     },
     ReturnValues: 'ALL_OLD'
@@ -308,17 +336,18 @@ async function deleteRecurringTransaction(id) {
     return createResponse(404, { error: 'Recurring transaction not found' });
   }
   
+  console.log(`Deleted recurring transaction ${id} for user ${userId}`);
   return createResponse(200, { message: 'Recurring transaction deleted successfully' });
 }
 
-// Toggle active status
-async function toggleRecurringTransaction(id) {
+// Toggle active status - USER FILTERED
+async function toggleRecurringTransaction(id, userId) {
   // First get current status
   const getParams = {
     TableName: TABLE_NAME,
     KeyConditionExpression: 'PK = :pk',
     ExpressionAttributeValues: {
-      ':pk': `RECURRING#${id}`
+      ':pk': `USER#${userId}#RECURRING#${id}`
     }
   };
   
@@ -334,7 +363,7 @@ async function toggleRecurringTransaction(id) {
   const updateParams = {
     TableName: TABLE_NAME,
     Key: {
-      PK: `RECURRING#${id}`,
+      PK: `USER#${userId}#RECURRING#${id}`,
       SK: 'METADATA'
     },
     UpdateExpression: 'SET is_active = :is_active, updated_at = :timestamp',
@@ -347,20 +376,22 @@ async function toggleRecurringTransaction(id) {
   
   const result = await dynamodb.send(new UpdateCommand(updateParams));
   
+  console.log(`Toggled recurring transaction ${id} to ${newActiveStatus ? 'active' : 'inactive'} for user ${userId}`);
+  
   return createResponse(200, {
     message: `Recurring transaction ${newActiveStatus ? 'activated' : 'deactivated'} successfully`,
     transaction: formatRecurringTransaction(result.Attributes)
   });
 }
 
-// Execute specific recurring transaction
-async function executeRecurringTransaction(id) {
-  // Get recurring transaction
+// Execute specific recurring transaction - USER FILTERED
+async function executeRecurringTransaction(id, userId) {
+  // Get recurring transaction - USER FILTERED
   const params = {
     TableName: TABLE_NAME,
     KeyConditionExpression: 'PK = :pk',
     ExpressionAttributeValues: {
-      ':pk': `RECURRING#${id}`
+      ':pk': `USER#${userId}#RECURRING#${id}`
     }
   };
   
@@ -376,24 +407,25 @@ async function executeRecurringTransaction(id) {
     return createResponse(400, { error: 'Cannot execute inactive recurring transaction' });
   }
   
-  // Create actual transaction
+  // Create actual transaction - USER SCOPED
   const transactionId = `txn-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   const timestamp = new Date().toISOString();
   const month = timestamp.substring(0, 7); // YYYY-MM format
   
   const transaction = {
-    PK: `TRANSACTION#${transactionId}`,
-    SK: timestamp,
+    PK: `USER#${userId}#TRANSACTION`,
+    SK: `TRANSACTION#${transactionId}`,
     GSI1PK: `MONTH#${month}`,
-    GSI1SK: timestamp,
+    GSI1SK: `${recurringTransaction.category}#${transactionId}`,
     id: transactionId,
     amount: recurringTransaction.amount,
     category: recurringTransaction.category,
-    description: `${recurringTransaction.description} (Auto-generated from: ${recurringTransaction.name})`,
+    note: `${recurringTransaction.description} (Auto-generated from: ${recurringTransaction.name})`,
     type: recurringTransaction.type,
     date: timestamp.split('T')[0],
     recurring_transaction_id: id,
-    created_at: timestamp
+    created_at: timestamp,
+    user_id: userId
   };
   
   // Update recurring transaction
@@ -410,7 +442,7 @@ async function executeRecurringTransaction(id) {
     dynamodb.send(new UpdateCommand({
       TableName: TABLE_NAME,
       Key: {
-        PK: `RECURRING#${id}`,
+        PK: `USER#${userId}#RECURRING#${id}`,
         SK: 'METADATA'
       },
       UpdateExpression: 'SET last_executed = :last_executed, next_execution = :next_execution, execution_count = execution_count + :one, updated_at = :timestamp',
@@ -423,13 +455,15 @@ async function executeRecurringTransaction(id) {
     }))
   ]);
   
+  console.log(`Executed recurring transaction ${id} for user ${userId}, created transaction ${transactionId}`);
+  
   return createResponse(200, {
     message: 'Recurring transaction executed successfully',
     transaction: {
       id: transaction.id,
       amount: transaction.amount,
       category: transaction.category,
-      description: transaction.description,
+      note: transaction.note,
       type: transaction.type,
       date: transaction.date,
       created_at: transaction.created_at
@@ -438,16 +472,16 @@ async function executeRecurringTransaction(id) {
   });
 }
 
-// Execute all due transactions
-async function executeDueTransactions() {
+// Execute all due transactions - USER FILTERED
+async function executeDueTransactions(userId) {
   const today = new Date().toISOString().split('T')[0];
   
-  // Get all active recurring transactions that are due
+  // Get all active recurring transactions that are due - USER FILTERED
   const params = {
     TableName: TABLE_NAME,
     FilterExpression: 'begins_with(PK, :pk) AND is_active = :active AND next_execution <= :today',
     ExpressionAttributeValues: {
-      ':pk': 'RECURRING#',
+      ':pk': `USER#${userId}#RECURRING#`,
       ':active': true,
       ':today': today
     }
@@ -456,6 +490,7 @@ async function executeDueTransactions() {
   const result = await dynamodb.send(new ScanCommand(params));
   
   if (!result.Items || result.Items.length === 0) {
+    console.log(`No recurring transactions due for execution for user ${userId}`);
     return createResponse(200, { message: 'No recurring transactions due for execution', executed_count: 0 });
   }
   
@@ -463,14 +498,16 @@ async function executeDueTransactions() {
   
   for (const recurringTransaction of result.Items) {
     try {
-      const executeResult = await executeRecurringTransaction(recurringTransaction.id);
+      const executeResult = await executeRecurringTransaction(recurringTransaction.id, userId);
       if (executeResult.statusCode === 200) {
         executedTransactions.push(recurringTransaction.name);
       }
     } catch (error) {
-      console.error(`Failed to execute recurring transaction ${recurringTransaction.id}:`, error);
+      console.error(`Failed to execute recurring transaction ${recurringTransaction.id} for user ${userId}:`, error);
     }
   }
+  
+  console.log(`Executed ${executedTransactions.length} recurring transactions for user ${userId}`);
   
   return createResponse(200, {
     message: `Executed ${executedTransactions.length} recurring transactions`,
@@ -479,8 +516,8 @@ async function executeDueTransactions() {
   });
 }
 
-// Get upcoming transactions
-async function getUpcomingTransactions(days = 7) {
+// Get upcoming transactions - USER FILTERED
+async function getUpcomingTransactions(days = 7, userId) {
   const today = new Date();
   const futureDate = new Date();
   futureDate.setDate(today.getDate() + days);
@@ -492,7 +529,7 @@ async function getUpcomingTransactions(days = 7) {
     TableName: TABLE_NAME,
     FilterExpression: 'begins_with(PK, :pk) AND is_active = :active AND next_execution >= :today AND next_execution <= :future',
     ExpressionAttributeValues: {
-      ':pk': 'RECURRING#',
+      ':pk': `USER#${userId}#RECURRING#`,
       ':active': true,
       ':today': todayStr,
       ':future': futureDateStr
@@ -515,6 +552,7 @@ async function getUpcomingTransactions(days = 7) {
   // Sort by next execution date
   upcomingTransactions.sort((a, b) => new Date(a.next_execution) - new Date(b.next_execution));
   
+  console.log(`Retrieved ${upcomingTransactions.length} upcoming transactions for user ${userId}`);
   return createResponse(200, upcomingTransactions);
 }
 

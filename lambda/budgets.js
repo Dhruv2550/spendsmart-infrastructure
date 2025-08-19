@@ -17,7 +17,7 @@ const corsHeaders = {
   'Content-Type': 'application/json',
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type'
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-User-ID'
 };
 
 const createResponse = (statusCode, body) => ({
@@ -25,6 +25,22 @@ const createResponse = (statusCode, body) => ({
   headers: corsHeaders,
   body: JSON.stringify(body)
 });
+
+const extractUserId = (event) => {
+  // Try X-User-ID header first
+  const userIdHeader = event.headers['X-User-ID'] || event.headers['x-user-id'];
+  if (userIdHeader) {
+    return userIdHeader;
+  }
+  
+  // Try Authorization Bearer token
+  const authHeader = event.headers['Authorization'] || event.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.substring(7);
+  }
+  
+  return null;
+};
 
 exports.handler = async (event) => {
   console.log('Event:', JSON.stringify(event, null, 2));
@@ -36,21 +52,29 @@ exports.handler = async (event) => {
   try {
     const { httpMethod, pathParameters, resource } = event;
     
+    // Extract and validate user ID
+    const userId = extractUserId(event);
+    if (!userId) {
+      return createResponse(401, { error: 'Unauthorized: User ID required' });
+    }
+    
+    console.log('Processing budgets request for user:', userId);
+    
     // Handle PUT requests for updating budgets
     if (httpMethod === 'PUT') {
-      return await updateEnvelopeBudget(event);
+      return await updateEnvelopeBudget(event, userId);
     }
     
     // Handle DELETE requests for budget templates
     if (httpMethod === 'DELETE' && resource.includes('/budget-templates/')) {
-      return await handleDeleteTemplate(pathParameters);
+      return await handleDeleteTemplate(pathParameters, userId);
     }
     
     // Handle different routes
     if (resource.includes('/budget-analysis/')) {
-      return await handleBudgetAnalysis(pathParameters);
+      return await handleBudgetAnalysis(pathParameters, userId);
     } else if (resource.includes('/budgets/')) {
-      return await handleBudgets(pathParameters);
+      return await handleBudgets(pathParameters, userId);
     }
     
     return createResponse(404, { error: 'Route not found' });
@@ -61,7 +85,7 @@ exports.handler = async (event) => {
   }
 };
 
-async function updateEnvelopeBudget(event) {
+async function updateEnvelopeBudget(event, userId) {
   const { template, month } = event.pathParameters;
   const decodedTemplate = decodeURIComponent(template);
   const decodedMonth = decodeURIComponent(month);
@@ -85,7 +109,7 @@ async function updateEnvelopeBudget(event) {
     const updateParams = {
       TableName: TABLE_NAME,
       Key: {
-        PK: `ENVELOPE#${decodedTemplate}`,
+        PK: `USER#${userId}#ENVELOPE#${decodedTemplate}`,
         SK: `${decodedMonth}#${budget.category}`
       },
       UpdateExpression: 'SET budget_amount = :amount',
@@ -99,28 +123,29 @@ async function updateEnvelopeBudget(event) {
   
   try {
     await Promise.all(updatePromises);
+    console.log(`Updated ${budgets.length} budgets for user ${userId}, template ${decodedTemplate}, month ${decodedMonth}`);
     return createResponse(200, { message: 'Budgets updated successfully' });
   } catch (error) {
-    console.error('Error updating budgets:', error);
+    console.error('Error updating budgets for user', userId, ':', error);
     return createResponse(500, { error: 'Failed to update budgets' });
   }
 }
 
-async function handleDeleteTemplate(pathParameters) {
+async function handleDeleteTemplate(pathParameters, userId) {
   const templateName = decodeURIComponent(pathParameters?.templateName || '');
-  console.log('Deleting template:', templateName);
+  console.log('Deleting template for user', userId, ':', templateName);
   
   if (!templateName) {
     return createResponse(400, { error: 'Missing template name' });
   }
   
   try {
-    // First, get all categories for this template
+    // First, get all categories for this template - USER FILTERED
     const getParams = {
       TableName: TABLE_NAME,
       KeyConditionExpression: 'PK = :pk',
       ExpressionAttributeValues: {
-        ':pk': `TEMPLATE#${templateName}`
+        ':pk': `USER#${userId}#TEMPLATE#${templateName}`
       }
     };
     
@@ -140,7 +165,7 @@ async function handleDeleteTemplate(pathParameters) {
       });
       
       await Promise.all(deletePromises);
-      console.log(`Successfully deleted ${result.Items.length} categories for template: ${templateName}`);
+      console.log(`Successfully deleted ${result.Items.length} categories for template: ${templateName} for user ${userId}`);
     }
     
     return createResponse(200, { 
@@ -149,7 +174,7 @@ async function handleDeleteTemplate(pathParameters) {
     });
     
   } catch (error) {
-    console.error('Error deleting template:', error);
+    console.error('Error deleting template for user', userId, ':', error);
     return createResponse(500, { 
       error: 'Failed to delete template',
       details: error.message 
@@ -157,41 +182,41 @@ async function handleDeleteTemplate(pathParameters) {
   }
 }
 
-async function handleBudgets(pathParameters) {
+async function handleBudgets(pathParameters, userId) {
   // FIX: Add URL decoding
   const template = decodeURIComponent(pathParameters?.template || '');
   const month = decodeURIComponent(pathParameters?.month || '');
   
-  console.log('Decoded template:', template);
-  console.log('Decoded month:', month);
+  console.log('User', userId, '- Decoded template:', template);
+  console.log('User', userId, '- Decoded month:', month);
   
   if (!template || !month) {
     return createResponse(400, { error: 'Missing template or month parameter' });
   }
   
-  // Get or create envelope budgets for this template/month
-  const budgets = await getOrCreateEnvelopeBudgets(template, month);
+  // Get or create envelope budgets for this template/month - USER FILTERED
+  const budgets = await getOrCreateEnvelopeBudgets(template, month, userId);
   
   return createResponse(200, budgets);
 }
 
-async function handleBudgetAnalysis(pathParameters) {
+async function handleBudgetAnalysis(pathParameters, userId) {
   // FIX: Add URL decoding
   const template = decodeURIComponent(pathParameters?.template || '');
   const month = decodeURIComponent(pathParameters?.month || '');
   
-  console.log('Analysis - Decoded template:', template);
-  console.log('Analysis - Decoded month:', month);
+  console.log('Analysis for user', userId, '- Decoded template:', template);
+  console.log('Analysis for user', userId, '- Decoded month:', month);
   
   if (!template || !month) {
     return createResponse(400, { error: 'Missing template or month parameter' });
   }
   
-  // Get envelope budgets
-  const budgets = await getOrCreateEnvelopeBudgets(template, month);
+  // Get envelope budgets - USER FILTERED
+  const budgets = await getOrCreateEnvelopeBudgets(template, month, userId);
   
-  // Get actual spending for this month
-  const actualSpending = await getActualSpending(month);
+  // Get actual spending for this month - USER FILTERED
+  const actualSpending = await getActualSpending(month, userId);
   
   // Calculate analysis
   const analysis = calculateBudgetAnalysis(budgets, actualSpending);
@@ -202,8 +227,8 @@ async function handleBudgetAnalysis(pathParameters) {
   });
 }
 
-async function getOrCreateEnvelopeBudgets(template, month) {
-  // First, check if envelope budgets already exist for this template/month
+async function getOrCreateEnvelopeBudgets(template, month, userId) {
+  // First, check if envelope budgets already exist for this template/month - USER FILTERED
   const existingBudgetsParams = {
     TableName: TABLE_NAME,
     FilterExpression: 'begins_with(PK, :pk) AND #month = :month',
@@ -211,7 +236,7 @@ async function getOrCreateEnvelopeBudgets(template, month) {
       '#month': 'month'
     },
     ExpressionAttributeValues: {
-      ':pk': `ENVELOPE#${template}`,
+      ':pk': `USER#${userId}#ENVELOPE#${template}`,
       ':month': month
     }
   };
@@ -220,7 +245,7 @@ async function getOrCreateEnvelopeBudgets(template, month) {
     const existingResult = await dynamodb.send(new ScanCommand(existingBudgetsParams));
     
     if (existingResult.Items && existingResult.Items.length > 0) {
-      console.log('Found existing envelope budgets:', existingResult.Items.length);
+      console.log('Found existing envelope budgets for user', userId, ':', existingResult.Items.length);
       // Return existing envelope budgets
       return existingResult.Items.map(item => ({
         id: item.id,
@@ -235,52 +260,52 @@ async function getOrCreateEnvelopeBudgets(template, month) {
       }));
     }
     
-    console.log('No existing envelope budgets found, creating from template');
+    console.log('No existing envelope budgets found for user', userId, ', creating from template');
     // If no envelope budgets exist, create them from the template
-    return await createEnvelopeBudgetsFromTemplate(template, month);
+    return await createEnvelopeBudgetsFromTemplate(template, month, userId);
     
   } catch (error) {
-    console.error('Error in getOrCreateEnvelopeBudgets:', error);
+    console.error('Error in getOrCreateEnvelopeBudgets for user', userId, ':', error);
     throw error;
   }
 }
 
-async function createEnvelopeBudgetsFromTemplate(template, month) {
-  console.log('Looking for template:', template);
+async function createEnvelopeBudgetsFromTemplate(template, month, userId) {
+  console.log('Looking for template for user', userId, ':', template);
   
-  // Get template categories
+  // Get template categories - USER FILTERED
   const templateParams = {
     TableName: TABLE_NAME,
     KeyConditionExpression: 'PK = :pk',
     ExpressionAttributeValues: {
-      ':pk': `TEMPLATE#${template}`
+      ':pk': `USER#${userId}#TEMPLATE#${template}`
     }
   };
   
   try {
     const templateResult = await dynamodb.send(new QueryCommand(templateParams));
-    console.log('Template query result:', templateResult.Items?.length || 0, 'items found');
+    console.log('Template query result for user', userId, ':', templateResult.Items?.length || 0, 'items found');
     
     if (!templateResult.Items || templateResult.Items.length === 0) {
-      // BETTER ERROR: Check what templates actually exist
+      // BETTER ERROR: Check what templates actually exist for this user
       const allTemplatesParams = {
         TableName: TABLE_NAME,
         FilterExpression: 'begins_with(PK, :pk)',
         ExpressionAttributeValues: {
-          ':pk': 'TEMPLATE#'
+          ':pk': `USER#${userId}#TEMPLATE#`
         }
       };
       
       const allTemplates = await dynamodb.send(new ScanCommand(allTemplatesParams));
       const templateNames = [...new Set(allTemplates.Items?.map(item => item.template_name) || [])];
       
-      console.log('Available templates:', templateNames);
+      console.log('Available templates for user', userId, ':', templateNames);
       throw new Error(`Template "${template}" not found. Available templates: ${templateNames.join(', ')}`);
     }
     
-    // Calculate rollover amounts from previous month
+    // Calculate rollover amounts from previous month - USER FILTERED
     const previousMonth = getPreviousMonth(month);
-    const rolloverAmounts = await calculateRolloverAmounts(template, previousMonth);
+    const rolloverAmounts = await calculateRolloverAmounts(template, previousMonth, userId);
     
     const timestamp = new Date().toISOString();
     const envelopeBudgets = [];
@@ -291,9 +316,9 @@ async function createEnvelopeBudgetsFromTemplate(template, month) {
       const rolloverAmount = rolloverAmounts[templateItem.category] || 0;
       
       const envelopeBudget = {
-        PK: `ENVELOPE#${template}`,
+        PK: `USER#${userId}#ENVELOPE#${template}`,
         SK: `${month}#${templateItem.category}`,
-        GSI1PK: `ENVELOPE_MONTH#${month}`,
+        GSI1PK: `USER#${userId}#ENVELOPE_MONTH#${month}`,
         GSI1SK: `${template}#${templateItem.category}`,
         id,
         template_name: template,
@@ -303,7 +328,8 @@ async function createEnvelopeBudgetsFromTemplate(template, month) {
         rollover_enabled: templateItem.rollover_enabled,
         rollover_amount: rolloverAmount,
         is_active: true,
-        created_at: timestamp
+        created_at: timestamp,
+        user_id: userId
       };
       
       envelopeBudgets.push({
@@ -325,7 +351,7 @@ async function createEnvelopeBudgetsFromTemplate(template, month) {
     
     // Batch write envelope budgets
     if (writeRequests.length > 0) {
-      console.log('Writing', writeRequests.length, 'envelope budgets');
+      console.log('Writing', writeRequests.length, 'envelope budgets for user', userId);
       const chunks = [];
       for (let i = 0; i < writeRequests.length; i += 25) {
         chunks.push(writeRequests.slice(i, i + 25));
@@ -340,24 +366,25 @@ async function createEnvelopeBudgetsFromTemplate(template, month) {
       }
     }
     
-    console.log('Successfully created', envelopeBudgets.length, 'envelope budgets');
+    console.log('Successfully created', envelopeBudgets.length, 'envelope budgets for user', userId);
     return envelopeBudgets;
     
   } catch (error) {
-    console.error('Error creating envelope budgets from template:', error);
+    console.error('Error creating envelope budgets from template for user', userId, ':', error);
     throw error;
   }
 }
 
-async function getActualSpending(month) {
-  // Use scan with filter to find transactions for the month
+async function getActualSpending(month, userId) {
+  // Use scan with filter to find transactions for the month - USER FILTERED
   const params = {
     TableName: TABLE_NAME,
-    FilterExpression: 'begins_with(GSI1PK, :monthPrefix) AND #type = :type',
+    FilterExpression: 'begins_with(PK, :userPk) AND begins_with(GSI1PK, :monthPrefix) AND #type = :type',
     ExpressionAttributeNames: {
       '#type': 'type'
     },
     ExpressionAttributeValues: {
+      ':userPk': `USER#${userId}#TRANSACTION`,
       ':monthPrefix': `MONTH#${month}`,
       ':type': 'Expense'
     }
@@ -377,17 +404,17 @@ async function getActualSpending(month) {
       });
     }
     
-    console.log('Actual spending by category:', spendingByCategory);
+    console.log('Actual spending by category for user', userId, ':', spendingByCategory);
     return spendingByCategory;
     
   } catch (error) {
-    console.error('Error getting actual spending:', error);
+    console.error('Error getting actual spending for user', userId, ':', error);
     return {};
   }
 }
 
-async function calculateRolloverAmounts(template, previousMonth) {
-  // Only get existing envelope budgets, don't create them
+async function calculateRolloverAmounts(template, previousMonth, userId) {
+  // Only get existing envelope budgets, don't create them - USER FILTERED
   const existingBudgetsParams = {
     TableName: TABLE_NAME,
     FilterExpression: 'begins_with(PK, :pk) AND #month = :month',
@@ -395,7 +422,7 @@ async function calculateRolloverAmounts(template, previousMonth) {
       '#month': 'month'
     },
     ExpressionAttributeValues: {
-      ':pk': `ENVELOPE#${template}`,
+      ':pk': `USER#${userId}#ENVELOPE#${template}`,
       ':month': previousMonth
     }
   };
@@ -405,12 +432,12 @@ async function calculateRolloverAmounts(template, previousMonth) {
     
     // If no previous budgets exist, return empty rollover amounts
     if (!existingResult.Items || existingResult.Items.length === 0) {
-      console.log('No previous month budgets found for rollover calculation');
+      console.log('No previous month budgets found for rollover calculation for user', userId);
       return {};
     }
     
-    // Get previous month's spending
-    const previousSpending = await getActualSpending(previousMonth);
+    // Get previous month's spending - USER FILTERED
+    const previousSpending = await getActualSpending(previousMonth, userId);
     
     const rolloverAmounts = {};
     
@@ -424,11 +451,11 @@ async function calculateRolloverAmounts(template, previousMonth) {
       }
     });
     
-    console.log('Calculated rollover amounts:', rolloverAmounts);
+    console.log('Calculated rollover amounts for user', userId, ':', rolloverAmounts);
     return rolloverAmounts;
     
   } catch (error) {
-    console.error('Error calculating rollover amounts:', error);
+    console.error('Error calculating rollover amounts for user', userId, ':', error);
     return {};
   }
 }
