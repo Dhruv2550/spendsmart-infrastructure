@@ -162,7 +162,6 @@ export class SpendSmartStack extends cdk.Stack {
       description: 'Handles recurring transaction operations'
     });
 
-    // Spending Alerts Lambda Function
     const spendingAlertsLambda = new lambda.Function(this, 'SpendingAlertsFunction', {
       ...lambdaDefaults,
       functionName: `spendsmart-spending-alerts-${stage}`,
@@ -171,13 +170,20 @@ export class SpendSmartStack extends cdk.Stack {
       description: 'Handles spending alerts operations'
     });
 
-    // Analytics Lambda Function
     const analyticsLambda = new lambda.Function(this, 'AnalyticsFunction', {
       ...lambdaDefaults,
       functionName: `spendsmart-analytics-${stage}`,
       code: lambda.Code.fromAsset('lambda'),
       handler: 'analytics.handler',
       description: 'Handles analytics and AI-powered insights operations'
+    });
+
+    const goalsLambda = new lambda.Function(this, 'GoalsFunction', {
+      ...lambdaDefaults,
+      functionName: `spendsmart-goals-${stage}`,
+      code: lambda.Code.fromAsset('lambda'),
+      handler: 'goals.handler',
+      description: 'Handles goals and contributions operations'
     });
 
     // Grant DynamoDB permissions
@@ -187,6 +193,7 @@ export class SpendSmartStack extends cdk.Stack {
     this.table.grantReadWriteData(recurringTransactionsLambda);
     this.table.grantReadWriteData(spendingAlertsLambda);
     this.table.grantReadWriteData(analyticsLambda);
+    this.table.grantReadWriteData(goalsLambda);
 
     // API Gateway - FIXED CORS CONFIGURATION
     this.api = new apigateway.RestApi(this, 'SpendSmartAPI', {
@@ -195,7 +202,7 @@ export class SpendSmartStack extends cdk.Stack {
       defaultCorsPreflightOptions: {
         allowOrigins: apigateway.Cors.ALL_ORIGINS,
         allowMethods: apigateway.Cors.ALL_METHODS,
-        allowHeaders: ['Content-Type', 'Authorization', 'X-User-ID'] // FIXED: Added X-User-ID
+        allowHeaders: ['Content-Type', 'Authorization', 'X-User-ID']
       },
       deployOptions: {
         stageName: stage
@@ -215,7 +222,7 @@ export class SpendSmartStack extends cdk.Stack {
     const recordById = records.addResource('{id}');
     recordById.addMethod('DELETE', transactionsIntegration);
 
-    // Budget Templates endpoints (new)
+    // Budget Templates endpoints
     const budgetTemplates = api.addResource('budget-templates');
     const budgetTemplatesIntegration = new apigateway.LambdaIntegration(budgetTemplatesLambda);
     
@@ -315,6 +322,41 @@ export class SpendSmartStack extends cdk.Stack {
     
     // GET /api/analytics/insights - get AI-powered spending insights
     insights.addMethod('GET', analyticsIntegration);
+
+    // Goals endpoints
+    const goals = api.addResource('goals');
+    const goalsIntegration = new apigateway.LambdaIntegration(goalsLambda);
+
+    // GET /api/goals - get all goals
+    // POST /api/goals - create new goal
+    goals.addMethod('GET', goalsIntegration);
+    goals.addMethod('POST', goalsIntegration);
+
+    // Goal-specific operations
+    const goalById = goals.addResource('{id}');
+    // GET /api/goals/{id} - get specific goal
+    // PUT /api/goals/{id} - update goal
+    // DELETE /api/goals/{id} - delete goal
+    goalById.addMethod('GET', goalsIntegration);
+    goalById.addMethod('PUT', goalsIntegration);
+    goalById.addMethod('DELETE', goalsIntegration);
+
+    // Contributions endpoints
+    const goalContributions = goalById.addResource('contributions');
+    // GET /api/goals/{id}/contributions - get contributions for goal
+    // POST /api/goals/{id}/contributions - add contribution to goal
+    goalContributions.addMethod('GET', goalsIntegration);
+    goalContributions.addMethod('POST', goalsIntegration);
+
+    // All contributions endpoint
+    const allContributions = goals.addResource('contributions');
+    // GET /api/goals/contributions - get all user contributions
+    allContributions.addMethod('GET', goalsIntegration);
+
+    // Individual contribution operations
+    const contributionById = allContributions.addResource('{contributionId}');
+    // DELETE /api/goals/contributions/{contributionId} - delete contribution
+    contributionById.addMethod('DELETE', goalsIntegration);
 
     // Health check (existing)
     const health = api.addResource('health');
