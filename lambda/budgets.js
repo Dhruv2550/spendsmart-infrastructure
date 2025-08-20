@@ -42,6 +42,16 @@ const extractUserId = (event) => {
   return null;
 };
 
+// Default template categories to create for new users
+const getDefaultTemplateCategories = () => [
+  { category: 'Food', budget_amount: 500, rollover_enabled: true },
+  { category: 'Transportation', budget_amount: 300, rollover_enabled: false },
+  { category: 'Entertainment', budget_amount: 200, rollover_enabled: true },
+  { category: 'Shopping', budget_amount: 400, rollover_enabled: false },
+  { category: 'Bills', budget_amount: 800, rollover_enabled: false },
+  { category: 'Healthcare', budget_amount: 150, rollover_enabled: true }
+];
+
 exports.handler = async (event) => {
   console.log('Event:', JSON.stringify(event, null, 2));
   
@@ -183,7 +193,6 @@ async function handleDeleteTemplate(pathParameters, userId) {
 }
 
 async function handleBudgets(pathParameters, userId) {
-  // FIX: Add URL decoding
   const template = decodeURIComponent(pathParameters?.template || '');
   const month = decodeURIComponent(pathParameters?.month || '');
   
@@ -201,7 +210,6 @@ async function handleBudgets(pathParameters, userId) {
 }
 
 async function handleBudgetAnalysis(pathParameters, userId) {
-  // FIX: Add URL decoding
   const template = decodeURIComponent(pathParameters?.template || '');
   const month = decodeURIComponent(pathParameters?.month || '');
   
@@ -270,6 +278,52 @@ async function getOrCreateEnvelopeBudgets(template, month, userId) {
   }
 }
 
+async function createDefaultTemplate(templateName, userId) {
+  console.log(`Creating default "${templateName}" template for new user:`, userId);
+  
+  const defaultCategories = getDefaultTemplateCategories();
+  const timestamp = new Date().toISOString();
+  
+  const writeRequests = [];
+  
+  for (const categoryData of defaultCategories) {
+    const templateItem = {
+      PK: `USER#${userId}#TEMPLATE#${templateName}`,
+      SK: `CATEGORY#${categoryData.category}`,
+      GSI1PK: `USER#${userId}#TEMPLATE_CATEGORY#${categoryData.category}`,
+      GSI1SK: `${templateName}#${categoryData.category}`,
+      template_name: templateName,
+      category: categoryData.category,
+      budget_amount: categoryData.budget_amount,
+      rollover_enabled: categoryData.rollover_enabled,
+      is_active: true,
+      created_at: timestamp,
+      user_id: userId
+    };
+    
+    writeRequests.push({
+      PutRequest: { Item: templateItem }
+    });
+  }
+  
+  // Write the template items in chunks
+  const chunks = [];
+  for (let i = 0; i < writeRequests.length; i += 25) {
+    chunks.push(writeRequests.slice(i, i + 25));
+  }
+  
+  for (const chunk of chunks) {
+    await dynamodb.send(new BatchWriteCommand({
+      RequestItems: {
+        [TABLE_NAME]: chunk
+      }
+    }));
+  }
+  
+  console.log(`Successfully created default "${templateName}" template with ${defaultCategories.length} categories for user ${userId}`);
+  return defaultCategories;
+}
+
 async function createEnvelopeBudgetsFromTemplate(template, month, userId) {
   console.log('Looking for template for user', userId, ':', template);
   
@@ -286,8 +340,10 @@ async function createEnvelopeBudgetsFromTemplate(template, month, userId) {
     const templateResult = await dynamodb.send(new QueryCommand(templateParams));
     console.log('Template query result for user', userId, ':', templateResult.Items?.length || 0, 'items found');
     
+    let templateCategories;
+    
     if (!templateResult.Items || templateResult.Items.length === 0) {
-      // BETTER ERROR: Check what templates actually exist for this user
+      // Check what templates actually exist for this user
       const allTemplatesParams = {
         TableName: TABLE_NAME,
         FilterExpression: 'begins_with(PK, :pk)',
@@ -300,7 +356,26 @@ async function createEnvelopeBudgetsFromTemplate(template, month, userId) {
       const templateNames = [...new Set(allTemplates.Items?.map(item => item.template_name) || [])];
       
       console.log('Available templates for user', userId, ':', templateNames);
-      throw new Error(`Template "${template}" not found. Available templates: ${templateNames.join(', ')}`);
+      
+      // If this is a "Default" template request and no templates exist, create one automatically
+      if (template === 'Default' && templateNames.length === 0) {
+        console.log('No templates found for new user. Creating default template automatically...');
+        const defaultCategories = await createDefaultTemplate('Default', userId);
+        
+        // Convert to template format for envelope creation
+        templateCategories = defaultCategories.map(cat => ({
+          template_name: 'Default',
+          category: cat.category,
+          budget_amount: cat.budget_amount,
+          rollover_enabled: cat.rollover_enabled
+        }));
+      } else {
+        // Template not found and it's not a default template scenario
+        throw new Error(`Template "${template}" not found. Available templates: ${templateNames.join(', ')}`);
+      }
+    } else {
+      // Use existing template
+      templateCategories = templateResult.Items;
     }
     
     // Calculate rollover amounts from previous month - USER FILTERED
@@ -311,7 +386,7 @@ async function createEnvelopeBudgetsFromTemplate(template, month, userId) {
     const envelopeBudgets = [];
     const writeRequests = [];
     
-    for (const templateItem of templateResult.Items) {
+    for (const templateItem of templateCategories) {
       const id = `${template}-${month}-${templateItem.category}-${Date.now()}`;
       const rolloverAmount = rolloverAmounts[templateItem.category] || 0;
       
@@ -360,7 +435,7 @@ async function createEnvelopeBudgetsFromTemplate(template, month, userId) {
       for (const chunk of chunks) {
         await dynamodb.send(new BatchWriteCommand({
           RequestItems: {
-            [`${TABLE_NAME}`]: chunk
+            [TABLE_NAME]: chunk
           }
         }));
       }
